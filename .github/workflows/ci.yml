@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc (нужен для сборки libsignal)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # Версия Rust берётся из rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  android:
+    name: Android build + Kotlin bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Add Android targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Build native libraries
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 \
+            -o out/jniLibs build -p kivi-ffi --release
+      - name: Check 16 KB page alignment (Google Play)
+        run: |
+          readelf="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for lib in out/jniLibs/arm64-v8a/libkivi_ffi.so out/jniLibs/x86_64/libkivi_ffi.so; do
+            if "$readelf" -lW "$lib" | awk '/LOAD/ && $NF != "0x4000" { bad = 1 } END { exit bad }'; then
+              echo "$lib: OK"
+            else
+              echo "$lib: LOAD segments are not 16 KB aligned" && exit 1
+            fi
+          done
+      - name: Generate Kotlin bindings
+        run: |
+          cargo build -p kivi-ffi
+          cargo run -p uniffi-bindgen -- generate --library target/debug/libkivi_ffi.so \
+            --language kotlin --no-format --out-dir out/kotlin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kivi-core-android
+          path: out/
+          retention-days: 14
