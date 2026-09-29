@@ -7,8 +7,9 @@ use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
     IdentityKeyPair, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord,
     PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SessionStore as _,
-    SignalMessage, SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem,
-    message_decrypt, message_encrypt, process_prekey_bundle,
+    SessionUsabilityRequirements, SignalMessage, SignalProtocolError, SignedPreKeyRecord,
+    SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
+    process_prekey_bundle,
 };
 use rand::Rng as _;
 
@@ -305,6 +306,28 @@ impl LocalDevice {
     ) -> Result<bool, CryptoError> {
         let remote = protocol_address(remote_account_id, remote_device_id)?;
         Ok(run(self.protocol_store().load_session(&remote))?.is_some())
+    }
+
+    /// Registration ID устройства собеседника из установленной сессии.
+    /// Нужен в `OutgoingMessage.destination_registration_id`: по нему сервер
+    /// узнаёт, что собеседник перерегистрировался (stale). `None` — сессии нет.
+    pub fn remote_registration_id(
+        &self,
+        remote_account_id: &str,
+        remote_device_id: u32,
+    ) -> Result<Option<u32>, CryptoError> {
+        let remote = protocol_address(remote_account_id, remote_device_id)?;
+        match run(self.protocol_store().load_session(&remote))? {
+            Some(record)
+                if record.has_usable_sender_chain(
+                    SystemTime::now(),
+                    SessionUsabilityRequirements::NotStale,
+                )? =>
+            {
+                Ok(Some(record.remote_registration_id()?))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Шифрует сообщение для одного устройства собеседника. Сессия должна

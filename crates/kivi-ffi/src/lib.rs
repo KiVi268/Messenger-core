@@ -306,6 +306,17 @@ impl KiviDevice {
             .has_session(&remote_account_id, remote_device_id)?)
     }
 
+    /// Registration ID собеседника из сессии, для `destination_registration_id`.
+    pub fn remote_registration_id(
+        &self,
+        remote_account_id: String,
+        remote_device_id: u32,
+    ) -> Result<Option<u32>, KiviError> {
+        Ok(self
+            .lock()
+            .remote_registration_id(&remote_account_id, remote_device_id)?)
+    }
+
     pub fn encrypt(
         &self,
         remote_account_id: String,
@@ -520,6 +531,12 @@ mod tests {
         drop(bob);
         let bob = open_device(bob_store).unwrap().expect("device exists");
         assert!(bob.has_session(ALICE.into(), 1).unwrap());
+        // Сессия, полученная входящим сообщением, знает registration ID собеседника.
+        assert_eq!(
+            bob.remote_registration_id(ALICE.into(), 1).unwrap(),
+            Some(alice.device_keys().unwrap().registration_id)
+        );
+        assert_eq!(bob.remote_registration_id(ALICE.into(), 2).unwrap(), None);
     }
 
     #[test]

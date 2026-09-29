@@ -48,6 +48,17 @@ fn keys_are_available_before_address_and_messaging_after() {
             .unwrap(),
         b"hello"
     );
+
+    // Registration ID собеседника доступен обеим сторонам сессии.
+    assert_eq!(
+        alice.remote_registration_id(BOB, 1).unwrap(),
+        Some(bob_keys.registration_id)
+    );
+    assert_eq!(
+        bob.remote_registration_id(ALICE, 1).unwrap(),
+        Some(keys.registration_id)
+    );
+    assert_eq!(alice.remote_registration_id(BOB, 2).unwrap(), None);
 }
 
 #[test]
