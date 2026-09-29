@@ -12,112 +12,15 @@
 //! Тест воспроизводит ровно то, что будет делать сервер, и проверяет
 //! результат настоящей валидацией libsignal.
 
-use curve25519_dalek::edwards::CompressedEdwardsY;
-use ed25519_dalek::{Signer as _, SigningKey};
-use libsignal_protocol::{
-    IdentityKeyPair, PublicKey, SenderCertificate, ServerCertificate, Timestamp,
+mod common;
+
+use common::{
+    ServerCertificateDataPb, ServerCertificatePb, ServerKey, sender_certificate, server_certificate,
 };
+use ed25519_dalek::Signer as _;
+use libsignal_protocol::{IdentityKeyPair, SenderCertificate, ServerCertificate, Timestamp};
 use prost::Message as _;
 use rand::RngCore as _;
-
-/// `sealed_sender.proto` из libsignal: ServerCertificate и его содержимое.
-#[derive(Clone, PartialEq, prost::Message)]
-struct ServerCertificatePb {
-    #[prost(bytes = "vec", optional, tag = "1")]
-    certificate: Option<Vec<u8>>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    signature: Option<Vec<u8>>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ServerCertificateDataPb {
-    #[prost(uint32, optional, tag = "1")]
-    id: Option<u32>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    key: Option<Vec<u8>>,
-}
-
-/// `sealed_sender.proto` из libsignal: SenderCertificate. Сертификат-обёртка
-/// имеет ту же структуру, что и ServerCertificatePb.
-#[derive(Clone, PartialEq, prost::Message)]
-struct SenderCertificateDataPb {
-    #[prost(uint32, optional, tag = "2")]
-    sender_device: Option<u32>,
-    #[prost(fixed64, optional, tag = "3")]
-    expires: Option<u64>,
-    #[prost(bytes = "vec", optional, tag = "4")]
-    identity_key: Option<Vec<u8>>,
-    /// Вариант `signer.certificate` из oneof: встроенный ServerCertificate.
-    #[prost(bytes = "vec", optional, tag = "5")]
-    signer_certificate: Option<Vec<u8>>,
-    /// Вариант `senderUuid.uuidBytes` из oneof: UUID, 16 байт.
-    #[prost(bytes = "vec", optional, tag = "7")]
-    uuid_bytes: Option<Vec<u8>>,
-}
-
-/// Ключ, которым «сервер» подписывает сертификаты.
-struct ServerKey(SigningKey);
-
-impl ServerKey {
-    fn random() -> Self {
-        let mut seed = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
-        Self(SigningKey::from_bytes(&seed))
-    }
-
-    /// Публичный ключ в формате libsignal: 0x05 + u-координата Curve25519.
-    fn libsignal_public_key(&self) -> PublicKey {
-        let edwards = CompressedEdwardsY(self.0.verifying_key().to_bytes())
-            .decompress()
-            .expect("valid Ed25519 public key");
-        PublicKey::from_djb_public_key_bytes(&edwards.to_montgomery().to_bytes()).unwrap()
-    }
-
-    /// Обычная подпись Ed25519 + знаковый бит ключа в старшем бите последнего байта.
-    fn sign(&self, message: &[u8]) -> Vec<u8> {
-        let mut signature = self.0.sign(message).to_bytes();
-        signature[63] |= self.0.verifying_key().to_bytes()[31] & 0x80;
-        signature.to_vec()
-    }
-}
-
-fn server_certificate(trust_root: &ServerKey, server: &ServerKey, key_id: u32) -> Vec<u8> {
-    let certificate = ServerCertificateDataPb {
-        id: Some(key_id),
-        key: Some(server.libsignal_public_key().serialize().into_vec()),
-    }
-    .encode_to_vec();
-    ServerCertificatePb {
-        signature: Some(trust_root.sign(&certificate)),
-        certificate: Some(certificate),
-    }
-    .encode_to_vec()
-}
-
-fn sender_certificate(
-    server: &ServerKey,
-    signer: Vec<u8>,
-    identity_key: &[u8],
-    expires: u64,
-) -> Vec<u8> {
-    let certificate = SenderCertificateDataPb {
-        sender_device: Some(1),
-        expires: Some(expires),
-        identity_key: Some(identity_key.to_vec()),
-        signer_certificate: Some(signer),
-        uuid_bytes: Some(
-            uuid::Uuid::from_u128(rand::rng().next_u64().into())
-                .into_bytes()
-                .to_vec(),
-        ),
-    }
-    .encode_to_vec();
-    ServerCertificatePb {
-        signature: Some(server.sign(&certificate)),
-        certificate: Some(certificate),
-    }
-    .encode_to_vec()
-}
 
 const NOW: u64 = 1_790_000_000_000;
 const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -142,7 +45,14 @@ impl Fixture {
 
     fn sender_certificate(&self) -> SenderCertificate {
         let signer = server_certificate(&self.trust_root, &self.server, 1);
-        let bytes = sender_certificate(&self.server, signer, &self.sender_identity, NOW + DAY);
+        let sender = uuid::Uuid::from_u128(rand::rng().next_u64().into());
+        let bytes = sender_certificate(
+            &self.server,
+            signer,
+            (sender, 1),
+            &self.sender_identity,
+            NOW + DAY,
+        );
         SenderCertificate::deserialize(&bytes).unwrap()
     }
 }

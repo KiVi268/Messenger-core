@@ -56,3 +56,12 @@ pub struct OutgoingCiphertext {
     pub kind: EnvelopeKind,
     pub content: Vec<u8>,
 }
+
+/// Расшифрованное сообщение sealed sender: отправитель берётся из
+/// проверенного сертификата, а не из конверта сервера.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedSenderMessage {
+    pub sender_account_id: String,
+    pub sender_device_id: u32,
+    pub plaintext: Vec<u8>,
+}

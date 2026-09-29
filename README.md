@@ -33,6 +33,16 @@ crates/
 | `process_bundle(account, bundle)` | Установить сессию по ответу `KeysService.GetPreKeyBundle` |
 | `encrypt(account, device, plaintext)` | Зашифровать сообщение для одного устройства → `OutgoingMessage` |
 | `decrypt(account, device, kind, content)` | Расшифровать `Envelope` |
+| `remote_registration_id(account, device)` | Registration ID собеседника из сессии → `OutgoingMessage.destination_registration_id` |
+| `sealed_sender_encrypt(account, device, certificate, plaintext)` | Sealed sender: сервер не узнаёт отправителя. `certificate` — от `CertificateService.GetSenderCertificate` |
+| `sealed_sender_decrypt(ciphertext, trust_root, timestamp_ms)` | Расшифровать конверт `ENVELOPE_TYPE_UNIDENTIFIED_SENDER`: отправитель — из сертификата, проверенного по trust root на момент приёма сервером |
+
+Функции:
+
+| Функция | Для чего |
+|---------|----------|
+| `generate_profile_key()` | Profile key аккаунта (32 байта), создаётся при регистрации |
+| `unidentified_access_key(profile_key)` | UAK (16 байт) = `HMAC-SHA256(profile_key, "KiVi unidentified access key v1")[0..16]` — для `RegisterRequest` и запросов sealed sender к собеседнику |
 
 ## Хранение состояния
 
@@ -62,6 +72,7 @@ interface KiviStore {
   2. переносит знаковый бит своего Ed25519-ключа в старший бит последнего байта подписи (`signature[63] |= pubkey[31] & 0x80`).
 
   Значит, сервер может выпускать сертификаты в родном формате libsignal (`sealed_sender.proto`), а клиенты — использовать sealed sender из libsignal без изменений.
+- **Sealed sender целиком** (`tests/sealed_sender.rs`): первое сообщение (с установкой сессии) и ответ собеседника через sealed sender с сертификатами, подписанными «как на сервере»; отказ при чужом trust root, истёкшем сертификате, сертификате чужого устройства и подменённом ключе идентичности.
 
 - Сборка под Android (`arm64-v8a`, `armeabi-v7a`, `x86_64`, minSdk 26), выравнивание страниц 16 КБ для 64-битных библиотек (требование Google Play).
 
@@ -118,7 +129,6 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libkivi_ffi.so \
 ## Открытые вопросы
 
 - **Подтверждение смены ключа собеседника.** Сейчас смена ключа только блокирует отправку (`UntrustedIdentity`); API для подтверждения пользователем — следующий шаг вместе с экраном safety numbers (EPIC-012).
-- **Формат сертификатов sealed sender в messenger-protocol** стоит заменить на формат libsignal — тест выше показывает, что сервер может его выпускать.
 
 ## Лицензирование вкладов
 

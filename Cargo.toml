@@ -18,8 +18,10 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0
 
 async-trait = "0.1"
 futures-util = "0.3"
+hmac = "0.13"
 prost = "0.14"
 rand = "0.9"
+sha2 = "0.11"
 thiserror = "2"
 uniffi = "0.29"
 uuid = "1"

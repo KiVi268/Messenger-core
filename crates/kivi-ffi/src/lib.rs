@@ -340,6 +340,67 @@ impl KiviDevice {
             .lock()
             .decrypt(&sender_account_id, sender_device_id, kind.into(), &content)?)
     }
+
+    /// Sealed sender: шифрование без раскрытия отправителя серверу.
+    /// `sender_certificate` — от `CertificateService.GetSenderCertificate`.
+    pub fn sealed_sender_encrypt(
+        &self,
+        remote_account_id: String,
+        remote_device_id: u32,
+        sender_certificate: Vec<u8>,
+        plaintext: Vec<u8>,
+    ) -> Result<Vec<u8>, KiviError> {
+        Ok(self.lock().sealed_sender_encrypt(
+            &remote_account_id,
+            remote_device_id,
+            &sender_certificate,
+            &plaintext,
+        )?)
+    }
+
+    /// Sealed sender: расшифровка и проверка сертификата отправителя по
+    /// trust root на момент `timestamp_ms` (время приёма сервером).
+    pub fn sealed_sender_decrypt(
+        &self,
+        ciphertext: Vec<u8>,
+        trust_root: Vec<u8>,
+        timestamp_ms: u64,
+    ) -> Result<SealedSenderMessage, KiviError> {
+        Ok(self
+            .lock()
+            .sealed_sender_decrypt(&ciphertext, &trust_root, timestamp_ms)?
+            .into())
+    }
+}
+
+/// Новый profile key: 32 случайных байта.
+#[uniffi::export]
+pub fn generate_profile_key() -> Vec<u8> {
+    crypto::generate_profile_key()
+}
+
+/// Unidentified access key (16 байт), выведенный из profile key.
+#[uniffi::export]
+pub fn unidentified_access_key(profile_key: Vec<u8>) -> Result<Vec<u8>, KiviError> {
+    Ok(crypto::unidentified_access_key(&profile_key)?)
+}
+
+/// Сообщение sealed sender: отправитель — из проверенного сертификата.
+#[derive(uniffi::Record, Debug, PartialEq, Eq)]
+pub struct SealedSenderMessage {
+    pub sender_account_id: String,
+    pub sender_device_id: u32,
+    pub plaintext: Vec<u8>,
+}
+
+impl From<crypto::SealedSenderMessage> for SealedSenderMessage {
+    fn from(m: crypto::SealedSenderMessage) -> Self {
+        Self {
+            sender_account_id: m.sender_account_id,
+            sender_device_id: m.sender_device_id,
+            plaintext: m.plaintext,
+        }
+    }
 }
 
 impl KiviDevice {
