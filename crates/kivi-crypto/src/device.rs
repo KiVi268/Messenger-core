@@ -1,52 +1,81 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt as _;
 use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
-    IdentityKeyPair, IdentityKeyStore as _, InMemSignalProtocolStore, KeyPair, KyberPreKeyRecord,
-    KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord, PreKeySignalMessage, PreKeyStore as _,
-    ProtocolAddress, PublicKey, SessionStore as _, SignalMessage, SignalProtocolError,
-    SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
-    process_prekey_bundle,
+    IdentityKeyPair, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord,
+    PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SessionStore as _,
+    SignalMessage, SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem,
+    message_decrypt, message_encrypt, process_prekey_bundle,
 };
 use rand::Rng as _;
 
 use crate::error::CryptoError;
+use crate::protocol_store::{LAST_RESORT_KYBER_PRE_KEY_ID, ProtocolStore};
+use crate::storage::{RecordKind, Storage};
 use crate::types::{
     DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SignedKey,
 };
 
 /// Registration ID в libsignal занимает 14 бит.
 const REGISTRATION_ID_MAX: u32 = 0x3FFF;
-/// ID подписанного EC-ключа и Kyber-ключа «последней надежды».
+/// ID подписанного EC-ключа.
 const SIGNED_PRE_KEY_ID: u32 = 1;
-const LAST_RESORT_KYBER_PRE_KEY_ID: u32 = 1;
 const KYBER_KEY_TYPE: kem::KeyType = kem::KeyType::Kyber1024;
 
+/// Ключи записей вида [`RecordKind::LocalAccount`].
+mod account {
+    pub const IDENTITY_KEY_PAIR: &str = "identity_key_pair";
+    pub const REGISTRATION_ID: &str = "registration_id";
+    pub const ACCOUNT_ID: &str = "account_id";
+    pub const DEVICE_ID: &str = "device_id";
+    pub const NEXT_PRE_KEY_ID: &str = "next_pre_key_id";
+    pub const NEXT_KYBER_PRE_KEY_ID: &str = "next_kyber_pre_key_id";
+}
+
 /// Устройство текущего пользователя: его ключи и сессии с собеседниками.
+///
+/// Всё состояние хранится в [`Storage`] платформы и переживает перезапуск
+/// приложения: при следующем запуске устройство открывается через
+/// [`LocalDevice::open`].
 pub struct LocalDevice {
+    storage: Arc<dyn Storage>,
     address: ProtocolAddress,
-    store: InMemSignalProtocolStore,
-    device_keys: DeviceKeys,
-    next_pre_key_id: u32,
-    next_kyber_pre_key_id: u32,
+    identity: IdentityKeyPair,
+    registration_id: u32,
 }
 
 impl LocalDevice {
-    /// Создаёт устройство с новыми ключами: ключ идентичности, registration
-    /// ID, подписанный EC-ключ и Kyber-ключ «последней надежды».
+    /// Создаёт устройство с новыми ключами и сохраняет их: ключ идентичности,
+    /// registration ID, подписанный EC-ключ и Kyber-ключ «последней надежды».
     ///
     /// `account_id` — UUID аккаунта, `device_id` — номер устройства
-    /// (основное — 1).
-    pub fn new(account_id: &str, device_id: u32) -> Result<Self, CryptoError> {
+    /// (основное — 1). Если в хранилище уже есть устройство, возвращает
+    /// [`CryptoError::AlreadyExists`].
+    pub fn create(
+        storage: Arc<dyn Storage>,
+        account_id: &str,
+        device_id: u32,
+    ) -> Result<Self, CryptoError> {
         let address = protocol_address(account_id, device_id)?;
-        let mut rng = rand::rng();
+        if storage
+            .load(RecordKind::LocalAccount, account::IDENTITY_KEY_PAIR)?
+            .is_some()
+        {
+            return Err(CryptoError::AlreadyExists);
+        }
 
+        let mut rng = rand::rng();
         let identity = IdentityKeyPair::generate(&mut rng);
         let registration_id = rng.random_range(1..=REGISTRATION_ID_MAX);
-        let mut store = InMemSignalProtocolStore::new(identity, registration_id)?;
-        let now = now_timestamp();
+        let device = Self {
+            storage,
+            address,
+            identity,
+            registration_id,
+        };
 
         let signed_pair = KeyPair::generate(&mut rng);
         let signed_signature = identity
@@ -55,91 +84,143 @@ impl LocalDevice {
             .map_err(SignalProtocolError::from)?;
         let signed_record = SignedPreKeyRecord::new(
             SIGNED_PRE_KEY_ID.into(),
-            now,
+            now_timestamp(),
             &signed_pair,
             &signed_signature,
         );
-        run(store.save_signed_pre_key(SIGNED_PRE_KEY_ID.into(), &signed_record))?;
+        run(device
+            .protocol_store()
+            .save_signed_pre_key(SIGNED_PRE_KEY_ID.into(), &signed_record))?;
 
         let kyber_record = KyberPreKeyRecord::generate(
             KYBER_KEY_TYPE,
             LAST_RESORT_KYBER_PRE_KEY_ID.into(),
             identity.private_key(),
         )?;
-        run(store.save_kyber_pre_key(LAST_RESORT_KYBER_PRE_KEY_ID.into(), &kyber_record))?;
+        run(device
+            .protocol_store()
+            .save_kyber_pre_key(LAST_RESORT_KYBER_PRE_KEY_ID.into(), &kyber_record))?;
 
-        let device_keys = DeviceKeys {
-            identity_public_key: identity.identity_key().serialize().into_vec(),
-            registration_id,
-            signed_pre_key: SignedKey {
-                key_id: SIGNED_PRE_KEY_ID,
-                public_key: signed_pair.public_key.serialize().into_vec(),
-                signature: signed_signature.into_vec(),
-            },
-            last_resort_kyber_pre_key: SignedKey {
-                key_id: LAST_RESORT_KYBER_PRE_KEY_ID,
-                public_key: kyber_record.public_key()?.serialize().into_vec(),
-                signature: kyber_record.signature()?,
-            },
+        // Ключ идентичности записывается последним: его наличие означает,
+        // что устройство создано полностью.
+        let s = &device.storage;
+        s.store(
+            RecordKind::LocalAccount,
+            account::ACCOUNT_ID,
+            account_id.as_bytes(),
+        )?;
+        s.store(
+            RecordKind::LocalAccount,
+            account::DEVICE_ID,
+            &device_id.to_be_bytes(),
+        )?;
+        s.store(
+            RecordKind::LocalAccount,
+            account::REGISTRATION_ID,
+            &registration_id.to_be_bytes(),
+        )?;
+        s.store(
+            RecordKind::LocalAccount,
+            account::NEXT_PRE_KEY_ID,
+            &1u32.to_be_bytes(),
+        )?;
+        s.store(
+            RecordKind::LocalAccount,
+            account::NEXT_KYBER_PRE_KEY_ID,
+            &(LAST_RESORT_KYBER_PRE_KEY_ID + 1).to_be_bytes(),
+        )?;
+        s.store(
+            RecordKind::LocalAccount,
+            account::IDENTITY_KEY_PAIR,
+            &identity.serialize(),
+        )?;
+        Ok(device)
+    }
+
+    /// Открывает ранее созданное устройство. `None` — устройства в хранилище нет.
+    pub fn open(storage: Arc<dyn Storage>) -> Result<Option<Self>, CryptoError> {
+        let Some(identity) = storage.load(RecordKind::LocalAccount, account::IDENTITY_KEY_PAIR)?
+        else {
+            return Ok(None);
         };
-
-        Ok(Self {
-            address,
-            store,
-            device_keys,
-            next_pre_key_id: 1,
-            next_kyber_pre_key_id: LAST_RESORT_KYBER_PRE_KEY_ID + 1,
-        })
+        let identity = IdentityKeyPair::try_from(identity.as_slice())?;
+        let account_id = required(&*storage, account::ACCOUNT_ID)?;
+        let account_id = String::from_utf8(account_id)
+            .map_err(|_| CryptoError::Malformed("stored account id is not UTF-8".to_owned()))?;
+        let device_id = read_u32(&*storage, account::DEVICE_ID)?;
+        let registration_id = read_u32(&*storage, account::REGISTRATION_ID)?;
+        Ok(Some(Self {
+            address: protocol_address(&account_id, device_id)?,
+            storage,
+            identity,
+            registration_id,
+        }))
     }
 
     /// Ключи для регистрации устройства на сервере.
-    pub fn device_keys(&self) -> &DeviceKeys {
-        &self.device_keys
+    pub fn device_keys(&self) -> Result<DeviceKeys, CryptoError> {
+        let store = self.protocol_store();
+        let signed = run(store.get_signed_pre_key(SIGNED_PRE_KEY_ID.into()))?;
+        let kyber = run(store.get_kyber_pre_key(LAST_RESORT_KYBER_PRE_KEY_ID.into()))?;
+        Ok(DeviceKeys {
+            identity_public_key: self.identity.identity_key().serialize().into_vec(),
+            registration_id: self.registration_id,
+            signed_pre_key: SignedKey {
+                key_id: SIGNED_PRE_KEY_ID,
+                public_key: signed.public_key()?.serialize().into_vec(),
+                signature: signed.signature()?,
+            },
+            last_resort_kyber_pre_key: SignedKey {
+                key_id: LAST_RESORT_KYBER_PRE_KEY_ID,
+                public_key: kyber.public_key()?.serialize().into_vec(),
+                signature: kyber.signature()?,
+            },
+        })
     }
 
     /// Генерирует одноразовые EC-ключи и сохраняет их приватные части.
     /// Публичные части отправляются на сервер (`UploadPreKeys.pre_keys`).
-    pub fn generate_pre_keys(&mut self, count: u32) -> Result<Vec<PreKey>, CryptoError> {
+    pub fn generate_pre_keys(&self, count: u32) -> Result<Vec<PreKey>, CryptoError> {
         let mut rng = rand::rng();
-        let mut keys = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let id = self.next_pre_key_id;
-            self.next_pre_key_id += 1;
-            let pair = KeyPair::generate(&mut rng);
-            run(self
-                .store
-                .save_pre_key(id.into(), &PreKeyRecord::new(id.into(), &pair)))?;
-            keys.push(PreKey {
-                key_id: id,
-                public_key: pair.public_key.serialize().into_vec(),
-            });
-        }
-        Ok(keys)
+        let first = self.reserve_ids(account::NEXT_PRE_KEY_ID, count)?;
+        let mut store = self.protocol_store();
+        (first..first + count)
+            .map(|id| {
+                let pair = KeyPair::generate(&mut rng);
+                run(store.save_pre_key(id.into(), &PreKeyRecord::new(id.into(), &pair)))?;
+                Ok(PreKey {
+                    key_id: id,
+                    public_key: pair.public_key.serialize().into_vec(),
+                })
+            })
+            .collect()
     }
 
     /// Генерирует одноразовые Kyber-ключи и сохраняет их приватные части.
     /// Публичные части отправляются на сервер (`UploadPreKeys.kyber_pre_keys`).
-    pub fn generate_kyber_pre_keys(&mut self, count: u32) -> Result<Vec<SignedKey>, CryptoError> {
-        let mut keys = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let id = self.next_kyber_pre_key_id;
-            self.next_kyber_pre_key_id += 1;
-            let identity = run(self.store.identity_store.get_identity_key_pair())?;
-            let record =
-                KyberPreKeyRecord::generate(KYBER_KEY_TYPE, id.into(), identity.private_key())?;
-            run(self.store.save_kyber_pre_key(id.into(), &record))?;
-            keys.push(SignedKey {
-                key_id: id,
-                public_key: record.public_key()?.serialize().into_vec(),
-                signature: record.signature()?,
-            });
-        }
-        Ok(keys)
+    pub fn generate_kyber_pre_keys(&self, count: u32) -> Result<Vec<SignedKey>, CryptoError> {
+        let first = self.reserve_ids(account::NEXT_KYBER_PRE_KEY_ID, count)?;
+        let mut store = self.protocol_store();
+        (first..first + count)
+            .map(|id| {
+                let record = KyberPreKeyRecord::generate(
+                    KYBER_KEY_TYPE,
+                    id.into(),
+                    self.identity.private_key(),
+                )?;
+                run(store.save_kyber_pre_key(id.into(), &record))?;
+                Ok(SignedKey {
+                    key_id: id,
+                    public_key: record.public_key()?.serialize().into_vec(),
+                    signature: record.signature()?,
+                })
+            })
+            .collect()
     }
 
     /// Устанавливает сессию с устройством собеседника по его ключам с сервера.
     pub fn process_bundle(
-        &mut self,
+        &self,
         remote_account_id: &str,
         bundle: &RemoteDeviceBundle,
     ) -> Result<(), CryptoError> {
@@ -165,8 +246,8 @@ impl LocalDevice {
         run(process_prekey_bundle(
             &remote,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
             &libsignal_bundle,
             SystemTime::now(),
             &mut rng,
@@ -180,13 +261,13 @@ impl LocalDevice {
         remote_device_id: u32,
     ) -> Result<bool, CryptoError> {
         let remote = protocol_address(remote_account_id, remote_device_id)?;
-        Ok(run(self.store.load_session(&remote))?.is_some())
+        Ok(run(self.protocol_store().load_session(&remote))?.is_some())
     }
 
     /// Шифрует сообщение для одного устройства собеседника. Сессия должна
     /// быть установлена (`process_bundle`) или получена входящим сообщением.
     pub fn encrypt(
-        &mut self,
+        &self,
         remote_account_id: &str,
         remote_device_id: u32,
         plaintext: &[u8],
@@ -197,8 +278,8 @@ impl LocalDevice {
             plaintext,
             &remote,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
             SystemTime::now(),
             &mut rng,
         ))?;
@@ -220,8 +301,12 @@ impl LocalDevice {
     /// Расшифровывает входящее сообщение. Для `PreKeyMessage` сессия
     /// устанавливается автоматически, использованный одноразовый ключ
     /// удаляется.
+    ///
+    /// Все изменения состояния записываются в [`Storage`] синхронно, в потоке
+    /// вызова. Платформа выполняет `decrypt` и сохранение сообщения в одной
+    /// транзакции своей БД и отправляет ACK только после её фиксации.
     pub fn decrypt(
-        &mut self,
+        &self,
         sender_account_id: &str,
         sender_device_id: u32,
         kind: EnvelopeKind,
@@ -241,14 +326,48 @@ impl LocalDevice {
             &message,
             &sender,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
-            &mut self.store.pre_key_store,
-            &self.store.signed_pre_key_store,
-            &mut self.store.kyber_pre_key_store,
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
+            &self.protocol_store(),
+            &mut self.protocol_store(),
             &mut rng,
         ))
     }
+
+    fn protocol_store(&self) -> ProtocolStore<'_> {
+        ProtocolStore {
+            storage: &*self.storage,
+            identity: self.identity,
+            registration_id: self.registration_id,
+        }
+    }
+
+    /// Резервирует `count` последовательных ID из счётчика и сохраняет новый
+    /// счётчик до генерации ключей: ID не переиспользуются даже при сбое.
+    fn reserve_ids(&self, counter: &str, count: u32) -> Result<u32, CryptoError> {
+        let first = read_u32(&*self.storage, counter)?;
+        let next = first
+            .checked_add(count)
+            .ok_or_else(|| CryptoError::Protocol("key id space exhausted".to_owned()))?;
+        self.storage
+            .store(RecordKind::LocalAccount, counter, &next.to_be_bytes())?;
+        Ok(first)
+    }
+}
+
+fn required(storage: &dyn Storage, key: &str) -> Result<Vec<u8>, CryptoError> {
+    storage
+        .load(RecordKind::LocalAccount, key)?
+        .ok_or_else(|| CryptoError::Malformed(format!("stored account is missing {key}")))
+}
+
+fn read_u32(storage: &dyn Storage, key: &str) -> Result<u32, CryptoError> {
+    let bytes = required(storage, key)?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| CryptoError::Malformed(format!("stored {key} is not u32")))?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 fn protocol_address(account_id: &str, device: u32) -> Result<ProtocolAddress, CryptoError> {
@@ -276,14 +395,13 @@ fn now_timestamp() -> Timestamp {
     Timestamp::from_epoch_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
-/// Хранилища в памяти никогда не ждут ввода-вывода, поэтому async-API
-/// libsignal завершается сразу. Когда появится постоянное хранилище, эту
-/// функцию заменит нормальный executor.
+/// Хранилище платформы синхронное, поэтому async-API libsignal поверх него
+/// завершается сразу, без executor'а.
 fn run<T, E: Into<CryptoError>>(
     future: impl Future<Output = Result<T, E>>,
 ) -> Result<T, CryptoError> {
     future
         .now_or_never()
-        .expect("in-memory libsignal stores complete synchronously")
+        .expect("storage callbacks are synchronous")
         .map_err(Into::into)
 }
