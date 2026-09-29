@@ -16,6 +16,7 @@ kivi-crypto = { path = "crates/kivi-crypto" }
 # libsignal не публикуется на crates.io — подключаем по тегу релиза.
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.103.1" }
 
+async-trait = "0.1"
 futures-util = "0.3"
 prost = "0.14"
 rand = "0.9"
