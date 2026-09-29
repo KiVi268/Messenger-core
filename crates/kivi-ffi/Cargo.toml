@@ -1,0 +1,21 @@
+[package]
+name = "kivi-ffi"
+description = "FFI-биндинги ядра KiVi Messenger для Android (Kotlin) и iOS (Swift) через UniFFI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "kivi_ffi"
+
+[dependencies]
+kivi-crypto.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true

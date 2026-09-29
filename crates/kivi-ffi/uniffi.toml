@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "com.kivi.core"
+cdylib_name = "kivi_ffi"
+
+[bindings.swift]
+module_name = "KiviCore"
