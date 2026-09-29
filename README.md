@@ -88,10 +88,13 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libkivi_ffi.so \
   --language swift --out-dir out/swift
 ```
 
+## Ключ идентичности
+
+Общий для всех устройств аккаунта (ADR-0003 в Messenger-KiVi). В `RemoteDeviceBundle` клиент подставляет `identity_public_key` из `GetPreKeyBundleResponse` — он одинаковый для всех устройств собеседника. Передача ключевой пары на привязываемое устройство — следующий шаг.
+
 ## Открытые вопросы
 
 - **Хранение состояния.** Сейчас ключи и сессии живут в памяти и теряются при перезапуске. Варианты: (а) ядро вызывает хранилище платформы через callback-интерфейсы UniFFI (Room/SQLCipher на Android, GRDB на iOS); (б) ядро само ведёт SQLCipher-базу. Нужно решить до реализации EPIC-004.
-- **Ключ идентичности при multi-device** — общий на аккаунт или свой у каждого устройства (см. README messenger-protocol).
 - **Формат сертификатов sealed sender в messenger-protocol** стоит заменить на формат libsignal — тест выше показывает, что сервер может его выпускать.
 
 ## Лицензирование вкладов
