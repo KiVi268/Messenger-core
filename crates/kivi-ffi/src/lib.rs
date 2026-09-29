@@ -30,6 +30,8 @@ pub enum KiviError {
     UntrustedIdentity(String),
     #[error("device already exists in storage")]
     AlreadyExists,
+    #[error("device is not registered yet")]
+    NotRegistered,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("protocol error: {0}")]
@@ -45,6 +47,7 @@ impl From<crypto::CryptoError> for KiviError {
             crypto::CryptoError::NoSession(v) => Self::NoSession(v),
             crypto::CryptoError::UntrustedIdentity(v) => Self::UntrustedIdentity(v),
             crypto::CryptoError::AlreadyExists => Self::AlreadyExists,
+            crypto::CryptoError::NotRegistered => Self::NotRegistered,
             crypto::CryptoError::Storage(v) => Self::Storage(v),
             crypto::CryptoError::Protocol(v) => Self::Protocol(v),
         }
@@ -69,15 +72,14 @@ pub enum RecordKind {
 /// Ошибка хранилища, которую возвращает реализация [`KiviStore`].
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum KiviStoreError {
-    #[error("{message}")]
-    Failed { message: String },
+    // Поле не называется `message`: в Kotlin оно конфликтует с Throwable.message.
+    #[error("{reason}")]
+    Failed { reason: String },
 }
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for KiviStoreError {
     fn from(err: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        Self::Failed {
-            message: err.reason,
-        }
+        Self::Failed { reason: err.reason }
     }
 }
 
@@ -157,6 +159,13 @@ pub fn open_device(store: Arc<dyn KiviStore>) -> Result<Option<Arc<KiviDevice>>,
     )
 }
 
+/// Адрес устройства: UUID аккаунта и номер устройства.
+#[derive(uniffi::Record, Debug, PartialEq, Eq)]
+pub struct DeviceAddress {
+    pub account_id: String,
+    pub device_id: u32,
+}
+
 #[derive(uniffi::Record)]
 pub struct PreKey {
     pub key_id: u32,
@@ -228,6 +237,32 @@ impl KiviDevice {
         }))
     }
 
+    /// Создаёт устройство с новыми ключами, но без адреса — первый шаг
+    /// регистрации: `deviceKeys()` уходят в `RegisterRequest`, адрес из
+    /// `RegisterResponse` задаётся через [`KiviDevice::set_address`].
+    #[uniffi::constructor]
+    pub fn generate(store: Arc<dyn KiviStore>) -> Result<Arc<Self>, KiviError> {
+        let storage = Arc::new(ForeignStorage(store));
+        Ok(Arc::new(Self {
+            inner: Mutex::new(crypto::LocalDevice::generate(storage)?),
+        }))
+    }
+
+    /// Задаёт адрес, выданный сервером при регистрации.
+    pub fn set_address(&self, account_id: String, device_id: u32) -> Result<(), KiviError> {
+        Ok(self.lock().set_address(&account_id, device_id)?)
+    }
+
+    /// Адрес устройства; `null`/`nil` — регистрация не завершена.
+    pub fn address(&self) -> Option<DeviceAddress> {
+        self.lock()
+            .address()
+            .map(|(account_id, device_id)| DeviceAddress {
+                account_id,
+                device_id,
+            })
+    }
+
     /// Ключи для регистрации устройства на сервере.
     pub fn device_keys(&self) -> Result<DeviceKeys, KiviError> {
         Ok(self.lock().device_keys()?.into())
@@ -269,6 +304,17 @@ impl KiviDevice {
         Ok(self
             .lock()
             .has_session(&remote_account_id, remote_device_id)?)
+    }
+
+    /// Registration ID собеседника из сессии, для `destination_registration_id`.
+    pub fn remote_registration_id(
+        &self,
+        remote_account_id: String,
+        remote_device_id: u32,
+    ) -> Result<Option<u32>, KiviError> {
+        Ok(self
+            .lock()
+            .remote_registration_id(&remote_account_id, remote_device_id)?)
     }
 
     pub fn encrypt(
@@ -431,7 +477,7 @@ mod tests {
 
     fn closed() -> KiviStoreError {
         KiviStoreError::Failed {
-            message: "db closed".into(),
+            reason: "db closed".into(),
         }
     }
 
@@ -485,6 +531,34 @@ mod tests {
         drop(bob);
         let bob = open_device(bob_store).unwrap().expect("device exists");
         assert!(bob.has_session(ALICE.into(), 1).unwrap());
+        // Сессия, полученная входящим сообщением, знает registration ID собеседника.
+        assert_eq!(
+            bob.remote_registration_id(ALICE.into(), 1).unwrap(),
+            Some(alice.device_keys().unwrap().registration_id)
+        );
+        assert_eq!(bob.remote_registration_id(ALICE.into(), 2).unwrap(), None);
+    }
+
+    #[test]
+    fn two_phase_registration_through_ffi() {
+        let store = Arc::new(TestStore::default());
+        let device = KiviDevice::generate(store.clone()).unwrap();
+        assert!(device.address().is_none());
+        assert!(device.device_keys().is_ok());
+        assert!(matches!(
+            device.encrypt(BOB.into(), 1, b"x".to_vec()),
+            Err(KiviError::NotRegistered)
+        ));
+        device.set_address(ALICE.into(), 1).unwrap();
+        drop(device);
+        let device = open_device(store).unwrap().expect("device exists");
+        assert_eq!(
+            device.address(),
+            Some(DeviceAddress {
+                account_id: ALICE.into(),
+                device_id: 1
+            })
+        );
     }
 
     #[test]

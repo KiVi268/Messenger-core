@@ -26,6 +26,10 @@ pub enum CryptoError {
     #[error("untrusted identity for {0}")]
     UntrustedIdentity(String),
 
+    /// Адрес устройства ещё не задан: регистрация не завершена.
+    #[error("device is not registered yet")]
+    NotRegistered,
+
     /// Устройство уже создано в этом хранилище.
     #[error("device already exists in storage")]
     AlreadyExists,
