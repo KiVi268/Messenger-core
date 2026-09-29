@@ -28,6 +28,16 @@ pub(crate) struct ProtocolStore<'a> {
 }
 
 impl ProtocolStore<'_> {
+    /// Принятый пользователем ключ собеседника; для записей, сохранённых до
+    /// появления [`RecordKind::TrustedIdentity`], — последний известный.
+    pub(crate) fn trusted_identity(&self, account_id: &str) -> Result<Option<IdentityKey>> {
+        let bytes = match self.load("trusted_identity", RecordKind::TrustedIdentity, account_id)? {
+            Some(bytes) => Some(bytes),
+            None => self.load("trusted_identity", RecordKind::RemoteIdentity, account_id)?,
+        };
+        bytes.map(|b| IdentityKey::decode(&b)).transpose()
+    }
+
     fn load(&self, method: &'static str, kind: RecordKind, key: &str) -> Result<Option<Vec<u8>>> {
         self.storage.load(kind, key).map_err(callback_error(method))
     }
@@ -71,6 +81,20 @@ impl IdentityKeyStore for ProtocolStore<'_> {
     ) -> Result<IdentityChange> {
         // Ключ идентичности общий на аккаунт (ADR-0003) — храним по account_id.
         let existing = self.get_identity(address).await?;
+        if self
+            .load("save_identity", RecordKind::TrustedIdentity, address.name())?
+            .is_none()
+        {
+            // Trust on first use. Для записей, сохранённых до появления
+            // TrustedIdentity, принятым считается прежний ключ.
+            let trusted = existing.unwrap_or(*identity);
+            self.store(
+                "save_identity",
+                RecordKind::TrustedIdentity,
+                address.name(),
+                &trusted.serialize(),
+            )?;
+        }
         self.store(
             "save_identity",
             RecordKind::RemoteIdentity,
@@ -86,13 +110,17 @@ impl IdentityKeyStore for ProtocolStore<'_> {
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-        _direction: Direction,
+        direction: Direction,
     ) -> Result<bool> {
-        // Trust on first use: новый собеседник доверенный, смена ключа — нет,
-        // пока пользователь её не подтвердит.
-        Ok(match self.get_identity(address).await? {
-            None => true,
-            Some(known) => known == *identity,
+        Ok(match direction {
+            // Приём не блокируется: иначе сообщения собеседника, сменившего
+            // ключ (переустановка), отбрасывались бы до подтверждения. Новый
+            // ключ сохраняется, и отправка ему ждёт подтверждения пользователя.
+            Direction::Receiving => true,
+            Direction::Sending => match self.trusted_identity(address.name())? {
+                None => true,
+                Some(trusted) => trusted == *identity,
+            },
         })
     }
 

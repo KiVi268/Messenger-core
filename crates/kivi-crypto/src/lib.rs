@@ -26,6 +26,6 @@ pub use profile::{
 };
 pub use storage::{MemoryStorage, RecordKind, Storage, StorageError};
 pub use types::{
-    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SealedSenderMessage,
-    SignedKey,
+    DeviceKeys, EnvelopeKind, IdentityStatus, OutgoingCiphertext, PreKey, RemoteDeviceBundle,
+    SafetyNumber, SealedSenderMessage, SignedKey,
 };

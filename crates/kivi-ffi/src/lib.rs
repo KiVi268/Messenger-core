@@ -63,6 +63,10 @@ pub enum RecordKind {
     LocalAccount,
     Session,
     RemoteIdentity,
+    /// Ключ собеседника, принятый пользователем (см. `kivi_crypto::RecordKind`).
+    TrustedIdentity,
+    /// Ключ собеседника со сверенным номером безопасности.
+    VerifiedIdentity,
     PreKey,
     SignedPreKey,
     KyberPreKey,
@@ -138,6 +142,8 @@ impl From<crypto::RecordKind> for RecordKind {
             crypto::RecordKind::LocalAccount => Self::LocalAccount,
             crypto::RecordKind::Session => Self::Session,
             crypto::RecordKind::RemoteIdentity => Self::RemoteIdentity,
+            crypto::RecordKind::TrustedIdentity => Self::TrustedIdentity,
+            crypto::RecordKind::VerifiedIdentity => Self::VerifiedIdentity,
             crypto::RecordKind::PreKey => Self::PreKey,
             crypto::RecordKind::SignedPreKey => Self::SignedPreKey,
             crypto::RecordKind::KyberPreKey => Self::KyberPreKey,
@@ -201,6 +207,23 @@ pub struct RemoteDeviceBundle {
 pub enum EnvelopeKind {
     Ciphertext,
     PreKeyMessage,
+}
+
+/// Состояние ключа идентичности собеседника (см. `kivi_crypto::IdentityStatus`).
+#[derive(uniffi::Enum, Debug, PartialEq, Eq)]
+pub enum IdentityStatus {
+    Unknown,
+    Trusted,
+    Verified,
+    /// Ключ сменился: приём работает, отправка — после `trust_identity`.
+    Changed,
+}
+
+/// Номер безопасности: 60 цифр и данные для QR-кода.
+#[derive(uniffi::Record, Debug, PartialEq, Eq)]
+pub struct SafetyNumber {
+    pub digits: String,
+    pub scannable: Vec<u8>,
 }
 
 #[derive(uniffi::Record)]
@@ -370,6 +393,58 @@ impl KiviDevice {
             .lock()
             .sealed_sender_decrypt(&ciphertext, &trust_root, timestamp_ms)?
             .into())
+    }
+
+    /// Состояние ключа собеседника: `Changed` — ключ сменился, отправка
+    /// заблокирована до `trust_identity`.
+    pub fn identity_status(&self, remote_account_id: String) -> Result<IdentityStatus, KiviError> {
+        Ok(self.lock().identity_status(&remote_account_id)?.into())
+    }
+
+    /// Принять новый ключ собеседника после смены.
+    pub fn trust_identity(&self, remote_account_id: String) -> Result<(), KiviError> {
+        Ok(self.lock().trust_identity(&remote_account_id)?)
+    }
+
+    /// Отметить ключ собеседника проверенным (номер сверен) или снять отметку.
+    pub fn set_verified(&self, remote_account_id: String, verified: bool) -> Result<(), KiviError> {
+        Ok(self.lock().set_verified(&remote_account_id, verified)?)
+    }
+
+    /// Номер безопасности для текущего ключа собеседника; `null`/`nil` — ключ неизвестен.
+    pub fn safety_number(
+        &self,
+        remote_account_id: String,
+    ) -> Result<Option<SafetyNumber>, KiviError> {
+        Ok(self
+            .lock()
+            .safety_number(&remote_account_id)?
+            .map(|n| SafetyNumber {
+                digits: n.digits,
+                scannable: n.scannable,
+            }))
+    }
+
+    /// Сравнить отсканированный QR-код собеседника со своим номером безопасности.
+    pub fn compare_safety_number(
+        &self,
+        remote_account_id: String,
+        scanned: Vec<u8>,
+    ) -> Result<bool, KiviError> {
+        Ok(self
+            .lock()
+            .compare_safety_number(&remote_account_id, &scanned)?)
+    }
+}
+
+impl From<crypto::IdentityStatus> for IdentityStatus {
+    fn from(status: crypto::IdentityStatus) -> Self {
+        match status {
+            crypto::IdentityStatus::Unknown => Self::Unknown,
+            crypto::IdentityStatus::Trusted => Self::Trusted,
+            crypto::IdentityStatus::Verified => Self::Verified,
+            crypto::IdentityStatus::Changed => Self::Changed,
+        }
     }
 }
 
