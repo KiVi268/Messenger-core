@@ -4,6 +4,9 @@
 //! `cargo run -p uniffi-bindgen -- generate --library <libkivi_ffi> --language kotlin --out-dir out`.
 //!
 //! Слой тонкий: типы повторяют `kivi-crypto`, вся логика — там.
+//!
+//! Состояние ядра хранится в БД платформы: Kotlin/Swift реализуют
+//! [`KiviStore`] (ADR-0004 в Messenger-KiVi).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -25,6 +28,10 @@ pub enum KiviError {
     NoSession(String),
     #[error("untrusted identity for {0}")]
     UntrustedIdentity(String),
+    #[error("device already exists in storage")]
+    AlreadyExists,
+    #[error("storage error: {0}")]
+    Storage(String),
     #[error("protocol error: {0}")]
     Protocol(String),
 }
@@ -37,9 +44,117 @@ impl From<crypto::CryptoError> for KiviError {
             crypto::CryptoError::Malformed(v) => Self::Malformed(v),
             crypto::CryptoError::NoSession(v) => Self::NoSession(v),
             crypto::CryptoError::UntrustedIdentity(v) => Self::UntrustedIdentity(v),
+            crypto::CryptoError::AlreadyExists => Self::AlreadyExists,
+            crypto::CryptoError::Storage(v) => Self::Storage(v),
             crypto::CryptoError::Protocol(v) => Self::Protocol(v),
         }
     }
+}
+
+/// Вид записи хранилища (см. `kivi_crypto::RecordKind`).
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum RecordKind {
+    /// Свой аккаунт: ключ идентичности, registration ID, счётчики.
+    /// Содержит приватный ключ — платформа дополнительно шифрует запись
+    /// аппаратным ключом (Keystore / Secure Enclave).
+    LocalAccount,
+    Session,
+    RemoteIdentity,
+    PreKey,
+    SignedPreKey,
+    KyberPreKey,
+    KyberBaseKeySeen,
+}
+
+/// Ошибка хранилища, которую возвращает реализация [`KiviStore`].
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum KiviStoreError {
+    #[error("{message}")]
+    Failed { message: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for KiviStoreError {
+    fn from(err: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Failed {
+            message: err.reason,
+        }
+    }
+}
+
+/// Хранилище «ключ → значение», реализуемое платформой поверх своей
+/// зашифрованной БД (Room + SQLCipher, GRDB + SQLCipher).
+///
+/// Методы вызываются синхронно в потоке, который вызвал метод
+/// [`KiviDevice`]. Поэтому, например, `decrypt` и сохранение сообщения можно
+/// выполнить в одной транзакции БД и отправить ACK после её фиксации.
+#[uniffi::export(with_foreign)]
+pub trait KiviStore: Send + Sync {
+    fn load(&self, kind: RecordKind, key: String) -> Result<Option<Vec<u8>>, KiviStoreError>;
+    fn store(&self, kind: RecordKind, key: String, value: Vec<u8>) -> Result<(), KiviStoreError>;
+    fn remove(&self, kind: RecordKind, key: String) -> Result<(), KiviStoreError>;
+}
+
+/// Адаптер хранилища платформы к `kivi_crypto::Storage`.
+struct ForeignStorage(Arc<dyn KiviStore>);
+
+impl crypto::Storage for ForeignStorage {
+    fn load(
+        &self,
+        kind: crypto::RecordKind,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, crypto::StorageError> {
+        self.0.load(kind.into(), key.to_owned()).map_err(Into::into)
+    }
+
+    fn store(
+        &self,
+        kind: crypto::RecordKind,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), crypto::StorageError> {
+        self.0
+            .store(kind.into(), key.to_owned(), value.to_vec())
+            .map_err(Into::into)
+    }
+
+    fn remove(&self, kind: crypto::RecordKind, key: &str) -> Result<(), crypto::StorageError> {
+        self.0
+            .remove(kind.into(), key.to_owned())
+            .map_err(Into::into)
+    }
+}
+
+impl From<KiviStoreError> for crypto::StorageError {
+    fn from(err: KiviStoreError) -> Self {
+        Self(err.to_string())
+    }
+}
+
+impl From<crypto::RecordKind> for RecordKind {
+    fn from(kind: crypto::RecordKind) -> Self {
+        match kind {
+            crypto::RecordKind::LocalAccount => Self::LocalAccount,
+            crypto::RecordKind::Session => Self::Session,
+            crypto::RecordKind::RemoteIdentity => Self::RemoteIdentity,
+            crypto::RecordKind::PreKey => Self::PreKey,
+            crypto::RecordKind::SignedPreKey => Self::SignedPreKey,
+            crypto::RecordKind::KyberPreKey => Self::KyberPreKey,
+            crypto::RecordKind::KyberBaseKeySeen => Self::KyberBaseKeySeen,
+        }
+    }
+}
+
+/// Открывает устройство, ранее созданное в этом хранилище.
+/// `null`/`nil` — устройства нет, нужно пройти регистрацию.
+#[uniffi::export]
+pub fn open_device(store: Arc<dyn KiviStore>) -> Result<Option<Arc<KiviDevice>>, KiviError> {
+    Ok(
+        crypto::LocalDevice::open(Arc::new(ForeignStorage(store)))?.map(|device| {
+            Arc::new(KiviDevice {
+                inner: Mutex::new(device),
+            })
+        }),
+    )
 }
 
 #[derive(uniffi::Record)]
@@ -94,17 +209,28 @@ pub struct KiviDevice {
 
 #[uniffi::export]
 impl KiviDevice {
-    /// Создаёт устройство с новыми ключами.
+    /// Создаёт устройство с новыми ключами и сохраняет их в хранилище.
+    /// Вызывается один раз — при регистрации. При следующих запусках
+    /// устройство открывается через [`open_device`].
     #[uniffi::constructor]
-    pub fn new(account_id: String, device_id: u32) -> Result<Arc<Self>, KiviError> {
+    pub fn create(
+        store: Arc<dyn KiviStore>,
+        account_id: String,
+        device_id: u32,
+    ) -> Result<Arc<Self>, KiviError> {
+        let storage = Arc::new(ForeignStorage(store));
         Ok(Arc::new(Self {
-            inner: Mutex::new(crypto::LocalDevice::new(&account_id, device_id)?),
+            inner: Mutex::new(crypto::LocalDevice::create(
+                storage,
+                &account_id,
+                device_id,
+            )?),
         }))
     }
 
     /// Ключи для регистрации устройства на сервере.
-    pub fn device_keys(&self) -> DeviceKeys {
-        self.lock().device_keys().clone().into()
+    pub fn device_keys(&self) -> Result<DeviceKeys, KiviError> {
+        Ok(self.lock().device_keys()?.into())
     }
 
     pub fn generate_pre_keys(&self, count: u32) -> Result<Vec<PreKey>, KiviError> {
@@ -271,17 +397,73 @@ impl From<crypto::OutgoingCiphertext> for OutgoingCiphertext {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    /// Хранилище «со стороны платформы»: проверяет путь через foreign trait.
+    #[derive(Default)]
+    struct TestStore(Mutex<HashMap<(u8, String), Vec<u8>>>);
+
+    impl KiviStore for TestStore {
+        fn load(&self, kind: RecordKind, key: String) -> Result<Option<Vec<u8>>, KiviStoreError> {
+            Ok(self.0.lock().unwrap().get(&(kind as u8, key)).cloned())
+        }
+
+        fn store(
+            &self,
+            kind: RecordKind,
+            key: String,
+            value: Vec<u8>,
+        ) -> Result<(), KiviStoreError> {
+            self.0.lock().unwrap().insert((kind as u8, key), value);
+            Ok(())
+        }
+
+        fn remove(&self, kind: RecordKind, key: String) -> Result<(), KiviStoreError> {
+            self.0.lock().unwrap().remove(&(kind as u8, key));
+            Ok(())
+        }
+    }
+
+    /// Хранилище, у которого закрыта БД.
+    struct FailingStore;
+
+    fn closed() -> KiviStoreError {
+        KiviStoreError::Failed {
+            message: "db closed".into(),
+        }
+    }
+
+    impl KiviStore for FailingStore {
+        fn load(&self, _: RecordKind, _: String) -> Result<Option<Vec<u8>>, KiviStoreError> {
+            Err(closed())
+        }
+
+        fn store(&self, _: RecordKind, _: String, _: Vec<u8>) -> Result<(), KiviStoreError> {
+            Err(closed())
+        }
+
+        fn remove(&self, _: RecordKind, _: String) -> Result<(), KiviStoreError> {
+            Err(closed())
+        }
+    }
 
     const ALICE: &str = "7f1c2e4a-9b3d-4c5e-8f6a-1b2c3d4e5f60";
     const BOB: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 
-    #[test]
-    fn round_trip_through_ffi_types() {
-        let alice = KiviDevice::new(ALICE.into(), 1).unwrap();
-        let bob = KiviDevice::new(BOB.into(), 1).unwrap();
+    fn device(account_id: &str) -> (Arc<TestStore>, Arc<KiviDevice>) {
+        let store = Arc::new(TestStore::default());
+        let device = KiviDevice::create(store.clone(), account_id.into(), 1).unwrap();
+        (store, device)
+    }
 
-        let keys = bob.device_keys();
+    #[test]
+    fn round_trip_through_ffi_types_and_restart() {
+        let (_, alice) = device(ALICE);
+        let (bob_store, bob) = device(BOB);
+
+        let keys = bob.device_keys().unwrap();
         let bundle = RemoteDeviceBundle {
             device_id: 1,
             registration_id: keys.registration_id,
@@ -298,13 +480,31 @@ mod tests {
             .decrypt(ALICE.into(), 1, message.kind, message.content)
             .unwrap();
         assert_eq!(plaintext, b"hello");
+
+        // Перезапуск: устройство Боба открывается из того же хранилища.
+        drop(bob);
+        let bob = open_device(bob_store).unwrap().expect("device exists");
+        assert!(bob.has_session(ALICE.into(), 1).unwrap());
+    }
+
+    #[test]
+    fn open_device_on_empty_store_returns_none() {
+        assert!(
+            open_device(Arc::new(TestStore::default()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn store_errors_are_reported() {
+        let result = KiviDevice::create(Arc::new(FailingStore), ALICE.into(), 1);
+        assert!(matches!(result, Err(KiviError::Storage(msg)) if msg.contains("db closed")));
     }
 
     #[test]
     fn errors_are_mapped() {
-        assert!(matches!(
-            KiviDevice::new("bad".into(), 1),
-            Err(KiviError::InvalidAccountId(_))
-        ));
+        let result = KiviDevice::create(Arc::new(TestStore::default()), "bad".into(), 1);
+        assert!(matches!(result, Err(KiviError::InvalidAccountId(_))));
     }
 }

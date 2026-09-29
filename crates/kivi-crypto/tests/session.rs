@@ -1,18 +1,21 @@
 //! Сквозной сценарий из PRD Phase 1: два устройства устанавливают сессию по
 //! ключам с сервера и обмениваются сообщениями в обе стороны.
 
-use kivi_crypto::{CryptoError, EnvelopeKind, LocalDevice, RemoteDeviceBundle};
+use std::sync::Arc;
+
+use kivi_crypto::{CryptoError, EnvelopeKind, LocalDevice, MemoryStorage, RemoteDeviceBundle};
 
 const ALICE: &str = "7f1c2e4a-9b3d-4c5e-8f6a-1b2c3d4e5f60";
 const BOB: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 
+/// Новое устройство с собственным хранилищем в памяти.
+fn new_device(account_id: &str) -> LocalDevice {
+    LocalDevice::create(Arc::new(MemoryStorage::default()), account_id, 1).unwrap()
+}
+
 /// Собирает ключи Боба так, как их выдал бы сервер (`GetPreKeyBundle`).
-fn bundle_of(
-    device: &mut LocalDevice,
-    device_id: u32,
-    with_one_time_keys: bool,
-) -> RemoteDeviceBundle {
-    let keys = device.device_keys().clone();
+fn bundle_of(device: &LocalDevice, device_id: u32, with_one_time_keys: bool) -> RemoteDeviceBundle {
+    let keys = device.device_keys().unwrap();
     let (pre_key, kyber_pre_key) = if with_one_time_keys {
         let pre_key = device.generate_pre_keys(1).unwrap().remove(0);
         let kyber = device.generate_kyber_pre_keys(1).unwrap().remove(0);
@@ -33,10 +36,10 @@ fn bundle_of(
 
 #[test]
 fn first_message_establishes_session_and_both_sides_can_talk() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
 
-    let bundle = bundle_of(&mut bob, 1, true);
+    let bundle = bundle_of(&bob, 1, true);
     alice.process_bundle(BOB, &bundle).unwrap();
     assert!(alice.has_session(BOB, 1).unwrap());
 
@@ -66,11 +69,11 @@ fn first_message_establishes_session_and_both_sides_can_talk() {
 
 #[test]
 fn session_works_without_one_time_pre_keys() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
 
     alice
-        .process_bundle(BOB, &bundle_of(&mut bob, 1, false))
+        .process_bundle(BOB, &bundle_of(&bob, 1, false))
         .unwrap();
     let message = alice.encrypt(BOB, 1, b"no one-time keys").unwrap();
     assert_eq!(
@@ -82,10 +85,10 @@ fn session_works_without_one_time_pre_keys() {
 
 #[test]
 fn out_of_order_messages_are_decrypted() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
     alice
-        .process_bundle(BOB, &bundle_of(&mut bob, 1, true))
+        .process_bundle(BOB, &bundle_of(&bob, 1, true))
         .unwrap();
 
     let first = alice.encrypt(BOB, 1, b"1").unwrap();
@@ -107,10 +110,10 @@ fn out_of_order_messages_are_decrypted() {
 
 #[test]
 fn replayed_message_is_rejected() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
     alice
-        .process_bundle(BOB, &bundle_of(&mut bob, 1, true))
+        .process_bundle(BOB, &bundle_of(&bob, 1, true))
         .unwrap();
 
     let first = alice.encrypt(BOB, 1, b"once").unwrap();
@@ -131,10 +134,10 @@ fn replayed_message_is_rejected() {
 
 #[test]
 fn tampered_ciphertext_is_rejected() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
     alice
-        .process_bundle(BOB, &bundle_of(&mut bob, 1, true))
+        .process_bundle(BOB, &bundle_of(&bob, 1, true))
         .unwrap();
 
     let mut message = alice.encrypt(BOB, 1, b"secret").unwrap();
@@ -148,10 +151,10 @@ fn tampered_ciphertext_is_rejected() {
 
 #[test]
 fn bundle_with_forged_signature_is_rejected() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let alice = new_device(ALICE);
+    let bob = new_device(BOB);
 
-    let mut bundle = bundle_of(&mut bob, 1, true);
+    let mut bundle = bundle_of(&bob, 1, true);
     bundle.signed_pre_key.signature[0] ^= 0x01;
     assert!(alice.process_bundle(BOB, &bundle).is_err());
     assert!(!alice.has_session(BOB, 1).unwrap());
@@ -159,7 +162,7 @@ fn bundle_with_forged_signature_is_rejected() {
 
 #[test]
 fn encrypt_without_session_fails() {
-    let mut alice = LocalDevice::new(ALICE, 1).unwrap();
+    let alice = new_device(ALICE);
     assert!(matches!(
         alice.encrypt(BOB, 1, b"x"),
         Err(CryptoError::NoSession(_))
@@ -168,24 +171,25 @@ fn encrypt_without_session_fails() {
 
 #[test]
 fn invalid_addresses_are_rejected() {
+    let storage = || Arc::new(MemoryStorage::default());
     assert!(matches!(
-        LocalDevice::new("not-a-uuid", 1),
+        LocalDevice::create(storage(), "not-a-uuid", 1),
         Err(CryptoError::InvalidAccountId(_))
     ));
     // libsignal поддерживает номера устройств 1..=127.
     assert!(matches!(
-        LocalDevice::new(ALICE, 0),
+        LocalDevice::create(storage(), ALICE, 0),
         Err(CryptoError::InvalidDeviceId(0))
     ));
     assert!(matches!(
-        LocalDevice::new(ALICE, 128),
+        LocalDevice::create(storage(), ALICE, 128),
         Err(CryptoError::InvalidDeviceId(128))
     ));
 }
 
 #[test]
 fn generated_key_ids_are_unique() {
-    let mut bob = LocalDevice::new(BOB, 1).unwrap();
+    let bob = new_device(BOB);
     let first = bob.generate_pre_keys(3).unwrap();
     let second = bob.generate_pre_keys(3).unwrap();
     let mut ids: Vec<u32> = first.iter().chain(&second).map(|k| k.key_id).collect();
@@ -194,7 +198,10 @@ fn generated_key_ids_are_unique() {
 
     // Kyber-ключ «последней надежды» имеет ID 1, одноразовые начинаются с 2.
     let kyber = bob.generate_kyber_pre_keys(2).unwrap();
-    assert_eq!(bob.device_keys().last_resort_kyber_pre_key.key_id, 1);
+    assert_eq!(
+        bob.device_keys().unwrap().last_resort_kyber_pre_key.key_id,
+        1
+    );
     assert_eq!(
         kyber.iter().map(|k| k.key_id).collect::<Vec<_>>(),
         vec![2, 3]

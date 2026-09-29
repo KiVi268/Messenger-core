@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 futures-util.workspace = true
 libsignal-protocol.workspace = true
 rand.workspace = true
