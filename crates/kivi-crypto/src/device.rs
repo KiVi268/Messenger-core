@@ -6,9 +6,9 @@ use futures_util::FutureExt as _;
 use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
     IdentityKeyPair, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SessionStore as _,
-    SessionUsabilityRequirements, SignalMessage, SignalProtocolError, SignedPreKeyRecord,
-    SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
+    PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SenderCertificate,
+    SessionStore as _, SessionUsabilityRequirements, SignalMessage, SignalProtocolError,
+    SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
     process_prekey_bundle,
 };
 use rand::Rng as _;
@@ -17,7 +17,8 @@ use crate::error::CryptoError;
 use crate::protocol_store::{LAST_RESORT_KYBER_PRE_KEY_ID, ProtocolStore};
 use crate::storage::{RecordKind, Storage};
 use crate::types::{
-    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SignedKey,
+    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SealedSenderMessage,
+    SignedKey,
 };
 
 /// Registration ID в libsignal занимает 14 бит.
@@ -399,6 +400,71 @@ impl LocalDevice {
             &mut self.protocol_store(),
             &mut rng,
         ))
+    }
+
+    /// Шифрует сообщение через sealed sender: сервер не узнаёт отправителя.
+    /// Сессия с устройством должна быть установлена, как для [`Self::encrypt`].
+    /// `sender_certificate` — `SenderCertificate` этого устройства от сервера.
+    pub fn sealed_sender_encrypt(
+        &self,
+        remote_account_id: &str,
+        remote_device_id: u32,
+        sender_certificate: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let local = self.local_address()?;
+        let remote = protocol_address(remote_account_id, remote_device_id)?;
+        let certificate = SenderCertificate::deserialize(sender_certificate)
+            .map_err(|e| CryptoError::Malformed(e.to_string()))?;
+        // Сертификат чужого устройства дал бы получателю неверный адрес для ответа.
+        if certificate.sender_uuid()? != local.name()
+            || certificate.sender_device_id()? != local.device_id()
+        {
+            return Err(CryptoError::Malformed(
+                "sender certificate is issued for another device".to_owned(),
+            ));
+        }
+        let mut rng = rand::rng();
+        run(libsignal_protocol::sealed_sender_encrypt(
+            &remote,
+            &certificate,
+            plaintext,
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
+            SystemTime::now(),
+            &mut rng,
+        ))
+    }
+
+    /// Расшифровывает сообщение sealed sender. Проверяет сертификат
+    /// отправителя по `trust_root` (публичный ключ, 33 байта) на момент
+    /// `timestamp_ms` — время приёма сообщения сервером.
+    pub fn sealed_sender_decrypt(
+        &self,
+        ciphertext: &[u8],
+        trust_root: &[u8],
+        timestamp_ms: u64,
+    ) -> Result<SealedSenderMessage, CryptoError> {
+        let local = self.local_address()?;
+        let trust_root = parse_public_key(trust_root)?;
+        let result = run(libsignal_protocol::sealed_sender_decrypt(
+            ciphertext,
+            &trust_root,
+            Timestamp::from_epoch_millis(timestamp_ms),
+            None,
+            local.name().to_owned(),
+            local.device_id(),
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
+            &mut self.protocol_store(),
+            &self.protocol_store(),
+            &mut self.protocol_store(),
+        ))?;
+        Ok(SealedSenderMessage {
+            sender_account_id: result.sender_uuid,
+            sender_device_id: result.device_id.into(),
+            plaintext: result.message,
+        })
     }
 
     fn local_address(&self) -> Result<&ProtocolAddress, CryptoError> {

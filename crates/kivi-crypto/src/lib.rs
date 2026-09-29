@@ -14,13 +14,18 @@
 
 mod device;
 mod error;
+mod profile;
 mod protocol_store;
 mod storage;
 mod types;
 
 pub use device::LocalDevice;
 pub use error::CryptoError;
+pub use profile::{
+    PROFILE_KEY_LEN, UNIDENTIFIED_ACCESS_KEY_LEN, generate_profile_key, unidentified_access_key,
+};
 pub use storage::{MemoryStorage, RecordKind, Storage, StorageError};
 pub use types::{
-    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SignedKey,
+    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SealedSenderMessage,
+    SignedKey,
 };
