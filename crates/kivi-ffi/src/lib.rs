@@ -72,15 +72,14 @@ pub enum RecordKind {
 /// Ошибка хранилища, которую возвращает реализация [`KiviStore`].
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum KiviStoreError {
-    #[error("{message}")]
-    Failed { message: String },
+    // Поле не называется `message`: в Kotlin оно конфликтует с Throwable.message.
+    #[error("{reason}")]
+    Failed { reason: String },
 }
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for KiviStoreError {
     fn from(err: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        Self::Failed {
-            message: err.reason,
-        }
+        Self::Failed { reason: err.reason }
     }
 }
 
@@ -467,7 +466,7 @@ mod tests {
 
     fn closed() -> KiviStoreError {
         KiviStoreError::Failed {
-            message: "db closed".into(),
+            reason: "db closed".into(),
         }
     }
 
