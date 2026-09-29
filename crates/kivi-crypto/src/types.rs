@@ -65,3 +65,30 @@ pub struct SealedSenderMessage {
     pub sender_device_id: u32,
     pub plaintext: Vec<u8>,
 }
+
+/// Состояние ключа идентичности собеседника (общий на аккаунт, ADR-0003).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityStatus {
+    /// Ключ собеседника ещё неизвестен: нет ни сессии, ни сообщений.
+    Unknown,
+    /// Ключ принят при первом контакте (trust on first use), номер
+    /// безопасности не сверялся.
+    Trusted,
+    /// Пользователь сверил номер безопасности с собеседником.
+    Verified,
+    /// Ключ изменился после того, как пользователь его принял. Сообщения от
+    /// собеседника принимаются, отправка — только после подтверждения
+    /// ([`crate::LocalDevice::trust_identity`]).
+    Changed,
+}
+
+/// Номер безопасности (safety number) пары «я — собеседник» для текущего
+/// ключа собеседника. У обоих собеседников одинаковый, если ключи не подменены.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyNumber {
+    /// 60 цифр: 12 групп по 5, для сверки вслух или на экране.
+    pub digits: String,
+    /// Данные для QR-кода: собеседник сканирует и сравнивает
+    /// ([`crate::LocalDevice::compare_safety_number`]).
+    pub scannable: Vec<u8>,
+}

@@ -4,9 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt as _;
 use libsignal_protocol::{
-    CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
-    IdentityKeyPair, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SenderCertificate,
+    CiphertextMessage, CiphertextMessageType, DeviceId, Fingerprint, GenericSignedPreKey as _,
+    IdentityKey, IdentityKeyPair, IdentityKeyStore as _, KeyPair, KyberPreKeyRecord,
+    KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord, PreKeySignalMessage, PreKeyStore as _,
+    ProtocolAddress, PublicKey, ScannableFingerprint, SenderCertificate, SessionRecord,
     SessionStore as _, SessionUsabilityRequirements, SignalMessage, SignalProtocolError,
     SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
     process_prekey_bundle,
@@ -14,11 +15,11 @@ use libsignal_protocol::{
 use rand::Rng as _;
 
 use crate::error::CryptoError;
-use crate::protocol_store::{LAST_RESORT_KYBER_PRE_KEY_ID, ProtocolStore};
+use crate::protocol_store::{LAST_RESORT_KYBER_PRE_KEY_ID, ProtocolStore, session_key};
 use crate::storage::{RecordKind, Storage};
 use crate::types::{
-    DeviceKeys, EnvelopeKind, OutgoingCiphertext, PreKey, RemoteDeviceBundle, SealedSenderMessage,
-    SignedKey,
+    DeviceKeys, EnvelopeKind, IdentityStatus, OutgoingCiphertext, PreKey, RemoteDeviceBundle,
+    SafetyNumber, SealedSenderMessage, SignedKey,
 };
 
 /// Registration ID в libsignal занимает 14 бит.
@@ -26,6 +27,10 @@ const REGISTRATION_ID_MAX: u32 = 0x3FFF;
 /// ID подписанного EC-ключа.
 const SIGNED_PRE_KEY_ID: u32 = 1;
 const KYBER_KEY_TYPE: kem::KeyType = kem::KeyType::Kyber1024;
+/// Параметры номера безопасности — как у Signal: версия 2 (идентификатор —
+/// 16 байт UUID аккаунта), 5200 итераций SHA-512.
+const FINGERPRINT_VERSION: u32 = 2;
+const FINGERPRINT_ITERATIONS: u32 = 5200;
 
 /// Ключи записей вида [`RecordKind::LocalAccount`].
 mod account {
@@ -288,7 +293,7 @@ impl LocalDevice {
             IdentityKey::decode(&bundle.identity_public_key)?,
         )?;
         let mut rng = rand::rng();
-        run(process_prekey_bundle(
+        match run(process_prekey_bundle(
             &remote,
             self.local_address()?,
             &mut self.protocol_store(),
@@ -296,17 +301,36 @@ impl LocalDevice {
             &libsignal_bundle,
             SystemTime::now(),
             &mut rng,
-        ))
+        )) {
+            Err(CryptoError::UntrustedIdentity(address)) => {
+                // Ключ собеседника сменился. Запоминаем новый, чтобы показать
+                // пользователю номер безопасности, — но только если ключи
+                // устройства им действительно подписаны.
+                let identity = IdentityKey::decode(&bundle.identity_public_key)?;
+                if !identity.public_key().verify_signature(
+                    &bundle.signed_pre_key.public_key,
+                    &bundle.signed_pre_key.signature,
+                ) {
+                    return Err(CryptoError::Protocol(
+                        "signed pre-key signature is invalid".to_owned(),
+                    ));
+                }
+                run(self.protocol_store().save_identity(&remote, &identity))?;
+                Err(CryptoError::UntrustedIdentity(address))
+            }
+            result => result,
+        }
     }
 
-    /// Есть ли сессия с устройством собеседника.
+    /// Есть ли сессия с устройством собеседника. Сессия со старым ключом
+    /// собеседника (до смены ключа) не считается: её нужно установить заново.
     pub fn has_session(
         &self,
         remote_account_id: &str,
         remote_device_id: u32,
     ) -> Result<bool, CryptoError> {
         let remote = protocol_address(remote_account_id, remote_device_id)?;
-        Ok(run(self.protocol_store().load_session(&remote))?.is_some())
+        Ok(self.current_session(&remote)?.is_some())
     }
 
     /// Registration ID устройства собеседника из установленной сессии.
@@ -318,7 +342,7 @@ impl LocalDevice {
         remote_device_id: u32,
     ) -> Result<Option<u32>, CryptoError> {
         let remote = protocol_address(remote_account_id, remote_device_id)?;
-        match run(self.protocol_store().load_session(&remote))? {
+        match self.current_session(&remote)? {
             Some(record)
                 if record.has_usable_sender_chain(
                     SystemTime::now(),
@@ -340,6 +364,7 @@ impl LocalDevice {
         plaintext: &[u8],
     ) -> Result<OutgoingCiphertext, CryptoError> {
         let remote = protocol_address(remote_account_id, remote_device_id)?;
+        self.current_session(&remote)?;
         let mut rng = rand::rng();
         let message = run(message_encrypt(
             plaintext,
@@ -414,6 +439,7 @@ impl LocalDevice {
     ) -> Result<Vec<u8>, CryptoError> {
         let local = self.local_address()?;
         let remote = protocol_address(remote_account_id, remote_device_id)?;
+        self.current_session(&remote)?;
         let certificate = SenderCertificate::deserialize(sender_certificate)
             .map_err(|e| CryptoError::Malformed(e.to_string()))?;
         // Сертификат чужого устройства дал бы получателю неверный адрес для ответа.
@@ -467,6 +493,145 @@ impl LocalDevice {
         })
     }
 
+    /// Состояние ключа идентичности собеседника.
+    pub fn identity_status(&self, remote_account_id: &str) -> Result<IdentityStatus, CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let Some(current) = self.remote_identity(&name)? else {
+            return Ok(IdentityStatus::Unknown);
+        };
+        let store = self.protocol_store();
+        if store.trusted_identity(&name)?.is_some_and(|t| t != current) {
+            return Ok(IdentityStatus::Changed);
+        }
+        let verified = self
+            .storage
+            .load(RecordKind::VerifiedIdentity, &name)?
+            .map(|b| IdentityKey::decode(&b))
+            .transpose()?;
+        Ok(if verified == Some(current) {
+            IdentityStatus::Verified
+        } else {
+            IdentityStatus::Trusted
+        })
+    }
+
+    /// Принимает текущий ключ собеседника после смены: отправка ему снова
+    /// разрешена. Отметка «проверено» к новому ключу не переносится.
+    pub fn trust_identity(&self, remote_account_id: &str) -> Result<(), CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let current = self
+            .remote_identity(&name)?
+            .ok_or_else(|| CryptoError::NoSession(name.clone()))?;
+        self.storage
+            .store(RecordKind::TrustedIdentity, &name, &current.serialize())?;
+        Ok(())
+    }
+
+    /// Отмечает текущий ключ собеседника проверенным (номер безопасности
+    /// сверен) или снимает отметку. Проверенный ключ заодно принимается.
+    pub fn set_verified(&self, remote_account_id: &str, verified: bool) -> Result<(), CryptoError> {
+        let name = account_name(remote_account_id)?;
+        if !verified {
+            self.storage.remove(RecordKind::VerifiedIdentity, &name)?;
+            return Ok(());
+        }
+        let current = self
+            .remote_identity(&name)?
+            .ok_or_else(|| CryptoError::NoSession(name.clone()))?;
+        self.storage
+            .store(RecordKind::TrustedIdentity, &name, &current.serialize())?;
+        self.storage
+            .store(RecordKind::VerifiedIdentity, &name, &current.serialize())?;
+        Ok(())
+    }
+
+    /// Номер безопасности для текущего ключа собеседника. `None` — ключ
+    /// собеседника ещё неизвестен.
+    pub fn safety_number(
+        &self,
+        remote_account_id: &str,
+    ) -> Result<Option<SafetyNumber>, CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let Some(remote_key) = self.remote_identity(&name)? else {
+            return Ok(None);
+        };
+        let fingerprint = self.fingerprint(&name, &remote_key)?;
+        Ok(Some(SafetyNumber {
+            digits: fingerprint.display_string().map_err(fingerprint_error)?,
+            scannable: fingerprint
+                .scannable
+                .serialize()
+                .map_err(fingerprint_error)?,
+        }))
+    }
+
+    /// Сравнивает QR-код с экрана собеседника (`SafetyNumber::scannable`) со
+    /// своим номером безопасности. `false` — ключи не совпадают (подмена или
+    /// один из собеседников видит устаревший ключ).
+    pub fn compare_safety_number(
+        &self,
+        remote_account_id: &str,
+        scanned: &[u8],
+    ) -> Result<bool, CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let remote_key = self
+            .remote_identity(&name)?
+            .ok_or_else(|| CryptoError::NoSession(name.clone()))?;
+        let ours: ScannableFingerprint = self.fingerprint(&name, &remote_key)?.scannable;
+        match ours.compare(scanned) {
+            Ok(same) => Ok(same),
+            Err(libsignal_protocol::FingerprintError::VersionMismatch { .. }) => Ok(false),
+            Err(e) => Err(CryptoError::Malformed(e.to_string())),
+        }
+    }
+
+    fn fingerprint(
+        &self,
+        remote_name: &str,
+        remote_key: &IdentityKey,
+    ) -> Result<Fingerprint, CryptoError> {
+        let local = self.local_address()?;
+        Fingerprint::new(
+            FINGERPRINT_VERSION,
+            FINGERPRINT_ITERATIONS,
+            uuid_bytes(local.name())?.as_slice(),
+            self.identity.identity_key(),
+            uuid_bytes(remote_name)?.as_slice(),
+            remote_key,
+        )
+        .map_err(fingerprint_error)
+    }
+
+    fn remote_identity(&self, name: &str) -> Result<Option<IdentityKey>, CryptoError> {
+        Ok(self
+            .storage
+            .load(RecordKind::RemoteIdentity, name)?
+            .map(|b| IdentityKey::decode(&b))
+            .transpose()?)
+    }
+
+    /// Сессия с устройством, если она с текущим ключом собеседника. Сессия со
+    /// старым ключом (собеседник сменил ключ) удаляется: шифровать в ней
+    /// бессмысленно, клиент установит новую по ключам с сервера.
+    fn current_session(
+        &self,
+        remote: &ProtocolAddress,
+    ) -> Result<Option<SessionRecord>, CryptoError> {
+        let Some(session) = run(self.protocol_store().load_session(remote))? else {
+            return Ok(None);
+        };
+        let current = self.remote_identity(remote.name())?;
+        let session_key_bytes = session.remote_identity_key_bytes()?;
+        if let Some(current) = current
+            && session_key_bytes.as_deref() != Some(&*current.serialize())
+        {
+            self.storage
+                .remove(RecordKind::Session, &session_key(remote))?;
+            return Ok(None);
+        }
+        Ok(Some(session))
+    }
+
     fn local_address(&self) -> Result<&ProtocolAddress, CryptoError> {
         self.address.as_ref().ok_or(CryptoError::NotRegistered)
     }
@@ -510,6 +675,22 @@ fn protocol_address(account_id: &str, device: u32) -> Result<ProtocolAddress, Cr
     let uuid = uuid::Uuid::parse_str(account_id)
         .map_err(|_| CryptoError::InvalidAccountId(account_id.to_owned()))?;
     Ok(ProtocolAddress::new(uuid.to_string(), device_id(device)?))
+}
+
+fn account_name(account_id: &str) -> Result<String, CryptoError> {
+    uuid::Uuid::parse_str(account_id)
+        .map(|uuid| uuid.to_string())
+        .map_err(|_| CryptoError::InvalidAccountId(account_id.to_owned()))
+}
+
+fn uuid_bytes(account_id: &str) -> Result<[u8; 16], CryptoError> {
+    uuid::Uuid::parse_str(account_id)
+        .map(|uuid| *uuid.as_bytes())
+        .map_err(|_| CryptoError::InvalidAccountId(account_id.to_owned()))
+}
+
+fn fingerprint_error(err: libsignal_protocol::FingerprintError) -> CryptoError {
+    CryptoError::Protocol(err.to_string())
 }
 
 fn device_id(device: u32) -> Result<DeviceId, CryptoError> {
