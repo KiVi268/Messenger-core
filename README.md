@@ -23,7 +23,10 @@ crates/
 
 | Метод | Для чего |
 |-------|----------|
-| `create(store, account_id, device_id)` | Создать устройство при регистрации: ключ идентичности, registration ID, подписанный EC-ключ, Kyber-ключ «последней надежды» |
+| `generate(store)` | Шаг 1 регистрации: ключ идентичности, registration ID, подписанный EC-ключ, Kyber-ключ «последней надежды» — без адреса |
+| `set_address(account_id, device_id)` | Шаг 2 регистрации: адрес из `RegisterResponse`. До него шифрование возвращает `NotRegistered` |
+| `create(store, account_id, device_id)` | `generate` + `set_address`, когда адрес известен заранее (тесты, привязка устройства) |
+| `address()` | Адрес устройства или `null`, если регистрация не завершена |
 | `open(store)` (в Kotlin/Swift — `openDevice`) | Открыть устройство при следующих запусках; `null`, если устройства нет |
 | `device_keys()` | Ключи для `AccountService.Register` |
 | `generate_pre_keys(n)`, `generate_kyber_pre_keys(n)` | Одноразовые ключи для `KeysService.UploadPreKeys` |

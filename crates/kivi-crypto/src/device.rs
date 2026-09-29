@@ -40,26 +40,44 @@ mod account {
 /// Всё состояние хранится в [`Storage`] платформы и переживает перезапуск
 /// приложения: при следующем запуске устройство открывается через
 /// [`LocalDevice::open`].
+///
+/// Регистрация идёт в два шага: ключи нужны серверу для регистрации, а
+/// адрес (UUID аккаунта и номер устройства) сервер выдаёт в ответ.
+/// 1. [`LocalDevice::generate`] — ключи без адреса, [`LocalDevice::device_keys`]
+///    уходят в `RegisterRequest`;
+/// 2. [`LocalDevice::set_address`] — адрес из `RegisterResponse`.
+///
+/// До второго шага сессии и шифрование недоступны ([`CryptoError::NotRegistered`]).
 pub struct LocalDevice {
     storage: Arc<dyn Storage>,
-    address: ProtocolAddress,
+    address: Option<ProtocolAddress>,
     identity: IdentityKeyPair,
     registration_id: u32,
 }
 
 impl LocalDevice {
-    /// Создаёт устройство с новыми ключами и сохраняет их: ключ идентичности,
-    /// registration ID, подписанный EC-ключ и Kyber-ключ «последней надежды».
-    ///
-    /// `account_id` — UUID аккаунта, `device_id` — номер устройства
-    /// (основное — 1). Если в хранилище уже есть устройство, возвращает
-    /// [`CryptoError::AlreadyExists`].
+    /// Создаёт устройство с известным адресом: [`LocalDevice::generate`] +
+    /// [`LocalDevice::set_address`].
     pub fn create(
         storage: Arc<dyn Storage>,
         account_id: &str,
         device_id: u32,
     ) -> Result<Self, CryptoError> {
-        let address = protocol_address(account_id, device_id)?;
+        // Адрес проверяется до генерации ключей, чтобы не оставить в хранилище
+        // устройство без адреса из-за опечатки в аргументах.
+        protocol_address(account_id, device_id)?;
+        let mut device = Self::generate(storage)?;
+        device.set_address(account_id, device_id)?;
+        Ok(device)
+    }
+
+    /// Создаёт устройство с новыми ключами и сохраняет их: ключ идентичности,
+    /// registration ID, подписанный EC-ключ и Kyber-ключ «последней надежды».
+    /// Адрес задаётся после регистрации через [`LocalDevice::set_address`].
+    ///
+    /// Если в хранилище уже есть устройство, возвращает
+    /// [`CryptoError::AlreadyExists`].
+    pub fn generate(storage: Arc<dyn Storage>) -> Result<Self, CryptoError> {
         if storage
             .load(RecordKind::LocalAccount, account::IDENTITY_KEY_PAIR)?
             .is_some()
@@ -72,7 +90,7 @@ impl LocalDevice {
         let registration_id = rng.random_range(1..=REGISTRATION_ID_MAX);
         let device = Self {
             storage,
-            address,
+            address: None,
             identity,
             registration_id,
         };
@@ -106,16 +124,6 @@ impl LocalDevice {
         let s = &device.storage;
         s.store(
             RecordKind::LocalAccount,
-            account::ACCOUNT_ID,
-            account_id.as_bytes(),
-        )?;
-        s.store(
-            RecordKind::LocalAccount,
-            account::DEVICE_ID,
-            &device_id.to_be_bytes(),
-        )?;
-        s.store(
-            RecordKind::LocalAccount,
             account::REGISTRATION_ID,
             &registration_id.to_be_bytes(),
         )?;
@@ -137,6 +145,33 @@ impl LocalDevice {
         Ok(device)
     }
 
+    /// Задаёт адрес устройства, выданный сервером при регистрации
+    /// (`RegisterResponse.account_id`, `device_id`). Повторный вызов (например,
+    /// после перерегистрации) заменяет адрес.
+    pub fn set_address(&mut self, account_id: &str, device_id: u32) -> Result<(), CryptoError> {
+        let address = protocol_address(account_id, device_id)?;
+        self.storage.store(
+            RecordKind::LocalAccount,
+            account::ACCOUNT_ID,
+            address.name().as_bytes(),
+        )?;
+        self.storage.store(
+            RecordKind::LocalAccount,
+            account::DEVICE_ID,
+            &device_id.to_be_bytes(),
+        )?;
+        self.address = Some(address);
+        Ok(())
+    }
+
+    /// Адрес устройства: UUID аккаунта и номер устройства. `None` — устройство
+    /// ещё не зарегистрировано.
+    pub fn address(&self) -> Option<(String, u32)> {
+        self.address
+            .as_ref()
+            .map(|a| (a.name().to_owned(), u32::from(a.device_id())))
+    }
+
     /// Открывает ранее созданное устройство. `None` — устройства в хранилище нет.
     pub fn open(storage: Arc<dyn Storage>) -> Result<Option<Self>, CryptoError> {
         let Some(identity) = storage.load(RecordKind::LocalAccount, account::IDENTITY_KEY_PAIR)?
@@ -144,13 +179,21 @@ impl LocalDevice {
             return Ok(None);
         };
         let identity = IdentityKeyPair::try_from(identity.as_slice())?;
-        let account_id = required(&*storage, account::ACCOUNT_ID)?;
-        let account_id = String::from_utf8(account_id)
-            .map_err(|_| CryptoError::Malformed("stored account id is not UTF-8".to_owned()))?;
-        let device_id = read_u32(&*storage, account::DEVICE_ID)?;
         let registration_id = read_u32(&*storage, account::REGISTRATION_ID)?;
+        // Адреса нет, если приложение закрыли между генерацией ключей и
+        // ответом сервера на регистрацию.
+        let address = match storage.load(RecordKind::LocalAccount, account::ACCOUNT_ID)? {
+            None => None,
+            Some(account_id) => {
+                let account_id = String::from_utf8(account_id).map_err(|_| {
+                    CryptoError::Malformed("stored account id is not UTF-8".to_owned())
+                })?;
+                let device_id = read_u32(&*storage, account::DEVICE_ID)?;
+                Some(protocol_address(&account_id, device_id)?)
+            }
+        };
         Ok(Some(Self {
-            address: protocol_address(&account_id, device_id)?,
+            address,
             storage,
             identity,
             registration_id,
@@ -245,7 +288,7 @@ impl LocalDevice {
         let mut rng = rand::rng();
         run(process_prekey_bundle(
             &remote,
-            &self.address,
+            self.local_address()?,
             &mut self.protocol_store(),
             &mut self.protocol_store(),
             &libsignal_bundle,
@@ -277,7 +320,7 @@ impl LocalDevice {
         let message = run(message_encrypt(
             plaintext,
             &remote,
-            &self.address,
+            self.local_address()?,
             &mut self.protocol_store(),
             &mut self.protocol_store(),
             SystemTime::now(),
@@ -325,7 +368,7 @@ impl LocalDevice {
         run(message_decrypt(
             &message,
             &sender,
-            &self.address,
+            self.local_address()?,
             &mut self.protocol_store(),
             &mut self.protocol_store(),
             &mut self.protocol_store(),
@@ -333,6 +376,10 @@ impl LocalDevice {
             &mut self.protocol_store(),
             &mut rng,
         ))
+    }
+
+    fn local_address(&self) -> Result<&ProtocolAddress, CryptoError> {
+        self.address.as_ref().ok_or(CryptoError::NotRegistered)
     }
 
     fn protocol_store(&self) -> ProtocolStore<'_> {
