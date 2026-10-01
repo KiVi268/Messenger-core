@@ -14,9 +14,9 @@ env:
 jobs:
   rust:
     name: fmt, clippy, tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install protoc (нужен для сборки libsignal)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       # Версия Rust берётся из rust-toolchain.toml.
@@ -27,9 +27,9 @@ jobs:
 
   android:
     name: Android build + Kotlin bindings
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -58,7 +58,7 @@ jobs:
           cargo build -p kivi-ffi
           cargo run -p uniffi-bindgen -- generate --library target/debug/libkivi_ffi.so \
             --language kotlin --no-format --out-dir out/kotlin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kivi-core-android
           path: out/
