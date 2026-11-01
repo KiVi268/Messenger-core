@@ -25,6 +25,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f2b8006a0c83f52b62ba44a97b58bf76fe2f70a329e588f67f89691d93d498f"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ctutils",
+ "ghash",
+]
+
+[[package]]
 name = "aes-gcm-siv"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,10 +914,12 @@ dependencies = [
 name = "kivi-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "curve25519-dalek",
  "ed25519-dalek",
  "futures-util",
+ "hkdf",
  "hmac",
  "libsignal-protocol",
  "prost",

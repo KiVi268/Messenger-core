@@ -271,6 +271,45 @@ impl KiviDevice {
         }))
     }
 
+    /// Привязанное устройство (ADR-0012): новые ключи устройства, но ключ
+    /// идентичности аккаунта — из `ProvisionMessage` основного устройства.
+    /// Адрес из `LinkDeviceResponse` задаётся через [`KiviDevice::set_address`].
+    #[uniffi::constructor]
+    pub fn generate_with_identity(
+        store: Arc<dyn KiviStore>,
+        identity_public_key: Vec<u8>,
+        identity_private_key: Vec<u8>,
+    ) -> Result<Arc<Self>, KiviError> {
+        let storage = Arc::new(ForeignStorage(store));
+        Ok(Arc::new(Self {
+            inner: Mutex::new(crypto::LocalDevice::generate_with_identity(
+                storage,
+                &identity_public_key,
+                &identity_private_key,
+            )?),
+        }))
+    }
+
+    /// Ключевая пара идентичности аккаунта — только для `ProvisionMessage`
+    /// при привязке нового устройства.
+    pub fn identity_key_pair(&self) -> IdentityKeyPair {
+        let (public_key, private_key) = self.lock().identity_key_pair();
+        IdentityKeyPair {
+            public_key,
+            private_key,
+        }
+    }
+
+    /// Имя устройства, зашифрованное ключом аккаунта (1–64 символа).
+    pub fn encrypt_device_name(&self, name: String) -> Result<Vec<u8>, KiviError> {
+        Ok(self.lock().encrypt_device_name(&name)?)
+    }
+
+    /// Расшифровать имя устройства своего аккаунта.
+    pub fn decrypt_device_name(&self, encrypted: Vec<u8>) -> Result<String, KiviError> {
+        Ok(self.lock().decrypt_device_name(&encrypted)?)
+    }
+
     /// Задаёт адрес, выданный сервером при регистрации.
     pub fn set_address(&self, account_id: String, device_id: u32) -> Result<(), KiviError> {
         Ok(self.lock().set_address(&account_id, device_id)?)
@@ -446,6 +485,64 @@ impl From<crypto::IdentityStatus> for IdentityStatus {
             crypto::IdentityStatus::Changed => Self::Changed,
         }
     }
+}
+
+/// Ключевая пара: публичный ключ в формате libsignal (`0x05` + 32 байта) и
+/// приватный (32 байта).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct IdentityKeyPair {
+    pub public_key: Vec<u8>,
+    pub private_key: Vec<u8>,
+}
+
+/// Поля `kivi.devices.v1.ProvisionEnvelope`.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionEnvelope {
+    pub public_key: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Новое устройство: временная пара X25519 для QR-кода привязки.
+#[uniffi::export]
+pub fn generate_provisioning_key_pair() -> IdentityKeyPair {
+    let pair = crypto::generate_provisioning_key_pair();
+    IdentityKeyPair {
+        public_key: pair.public_key,
+        private_key: pair.private_key,
+    }
+}
+
+/// Основное устройство: зашифровать сериализованный `ProvisionMessage` на
+/// ключ из QR-кода нового устройства.
+#[uniffi::export]
+pub fn encrypt_provision(
+    qr_public_key: Vec<u8>,
+    plaintext: Vec<u8>,
+) -> Result<ProvisionEnvelope, KiviError> {
+    let envelope = crypto::encrypt_provision(&qr_public_key, &plaintext)?;
+    Ok(ProvisionEnvelope {
+        public_key: envelope.public_key,
+        nonce: envelope.nonce,
+        ciphertext: envelope.ciphertext,
+    })
+}
+
+/// Новое устройство: расшифровать `ProvisionEnvelope` своим временным
+/// приватным ключом. Подменённый конверт — `KiviError.Malformed`.
+#[uniffi::export]
+pub fn decrypt_provision(
+    qr_private_key: Vec<u8>,
+    envelope: ProvisionEnvelope,
+) -> Result<Vec<u8>, KiviError> {
+    Ok(crypto::decrypt_provision(
+        &qr_private_key,
+        &crypto::ProvisionCiphertext {
+            public_key: envelope.public_key,
+            nonce: envelope.nonce,
+            ciphertext: envelope.ciphertext,
+        },
+    )?)
 }
 
 /// Новый profile key: 32 случайных байта.
