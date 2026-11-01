@@ -7,13 +7,14 @@ use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, DeviceId, Fingerprint, GenericSignedPreKey as _,
     IdentityKey, IdentityKeyPair, IdentityKeyStore as _, KeyPair, KyberPreKeyRecord,
     KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord, PreKeySignalMessage, PreKeyStore as _,
-    ProtocolAddress, PublicKey, ScannableFingerprint, SenderCertificate, SessionRecord,
+    PrivateKey, ProtocolAddress, PublicKey, ScannableFingerprint, SenderCertificate, SessionRecord,
     SessionStore as _, SessionUsabilityRequirements, SignalMessage, SignalProtocolError,
     SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem, message_decrypt, message_encrypt,
     process_prekey_bundle,
 };
 use rand::Rng as _;
 
+use crate::device_name;
 use crate::error::CryptoError;
 use crate::protocol_store::{LAST_RESORT_KYBER_PRE_KEY_ID, ProtocolStore, session_key};
 use crate::storage::{RecordKind, Storage};
@@ -85,6 +86,38 @@ impl LocalDevice {
     /// Если в хранилище уже есть устройство, возвращает
     /// [`CryptoError::AlreadyExists`].
     pub fn generate(storage: Arc<dyn Storage>) -> Result<Self, CryptoError> {
+        let identity = IdentityKeyPair::generate(&mut rand::rng());
+        Self::generate_with(storage, identity)
+    }
+
+    /// Привязанное устройство (ADR-0012): как [`LocalDevice::generate`], но с
+    /// ключом идентичности аккаунта, полученным от основного устройства в
+    /// `ProvisionMessage`. Свои registration ID, подписанный EC-ключ и
+    /// Kyber-ключ «последней надежды» подписываются этим ключом.
+    ///
+    /// Публичный ключ — формат libsignal (`0x05` + 32 байта), приватный —
+    /// 32 байта. Ключи не образуют пару — [`CryptoError::Malformed`].
+    pub fn generate_with_identity(
+        storage: Arc<dyn Storage>,
+        identity_public_key: &[u8],
+        identity_private_key: &[u8],
+    ) -> Result<Self, CryptoError> {
+        let public = IdentityKey::decode(identity_public_key)
+            .map_err(|_| CryptoError::Malformed("identity public key".to_owned()))?;
+        let private = PrivateKey::deserialize(identity_private_key)
+            .map_err(|_| CryptoError::Malformed("identity private key".to_owned()))?;
+        if private.public_key().map_err(SignalProtocolError::from)? != *public.public_key() {
+            return Err(CryptoError::Malformed(
+                "identity private key does not match public key".to_owned(),
+            ));
+        }
+        Self::generate_with(storage, IdentityKeyPair::new(public, private))
+    }
+
+    fn generate_with(
+        storage: Arc<dyn Storage>,
+        identity: IdentityKeyPair,
+    ) -> Result<Self, CryptoError> {
         if storage
             .load(RecordKind::LocalAccount, account::IDENTITY_KEY_PAIR)?
             .is_some()
@@ -93,7 +126,6 @@ impl LocalDevice {
         }
 
         let mut rng = rand::rng();
-        let identity = IdentityKeyPair::generate(&mut rng);
         let registration_id = rng.random_range(1..=REGISTRATION_ID_MAX);
         let device = Self {
             storage,
@@ -205,6 +237,29 @@ impl LocalDevice {
             identity,
             registration_id,
         }))
+    }
+
+    /// Ключевая пара идентичности аккаунта для `ProvisionMessage`: публичный
+    /// ключ (`0x05` + 32 байта) и приватный (32 байта). Нужна только основному
+    /// устройству при привязке нового (ADR-0003, ADR-0012); больше приватный
+    /// ключ никуда не передаётся.
+    pub fn identity_key_pair(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.identity.identity_key().serialize().into_vec(),
+            self.identity.private_key().serialize().to_vec(),
+        )
+    }
+
+    /// Имя устройства, зашифрованное ключом аккаунта, для
+    /// `LinkDeviceRequest.encrypted_name` и `SetDeviceNameRequest`
+    /// (messenger-protocol, README, «Имя устройства»). Имя — 1–64 символа.
+    pub fn encrypt_device_name(&self, name: &str) -> Result<Vec<u8>, CryptoError> {
+        device_name::encrypt(self.identity.private_key(), name)
+    }
+
+    /// Расшифровать имя устройства своего аккаунта из `ListDevicesResponse`.
+    pub fn decrypt_device_name(&self, encrypted: &[u8]) -> Result<String, CryptoError> {
+        device_name::decrypt(self.identity.private_key(), encrypted)
     }
 
     /// Ключи для регистрации устройства на сервере.

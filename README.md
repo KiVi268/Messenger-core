@@ -25,7 +25,10 @@ crates/
 |-------|----------|
 | `generate(store)` | Шаг 1 регистрации: ключ идентичности, registration ID, подписанный EC-ключ, Kyber-ключ «последней надежды» — без адреса |
 | `set_address(account_id, device_id)` | Шаг 2 регистрации: адрес из `RegisterResponse`. До него шифрование возвращает `NotRegistered` |
-| `create(store, account_id, device_id)` | `generate` + `set_address`, когда адрес известен заранее (тесты, привязка устройства) |
+| `create(store, account_id, device_id)` | `generate` + `set_address`, когда адрес известен заранее (тесты) |
+| `generate_with_identity(store, identity_public, identity_private)` | Привязанное устройство (ADR-0012): свои ключи устройства, ключ идентичности аккаунта — из `ProvisionMessage`. Ключи не образуют пару — `Malformed` |
+| `identity_key_pair()` | Ключевая пара идентичности для `ProvisionMessage` — только основному устройству при привязке нового |
+| `encrypt_device_name(name)`, `decrypt_device_name(bytes)` | Имя устройства, зашифрованное ключом аккаунта (`LinkDeviceRequest`, `SetDeviceName`, `ListDevices`) |
 | `address()` | Адрес устройства или `null`, если регистрация не завершена |
 | `open(store)` (в Kotlin/Swift — `openDevice`) | Открыть устройство при следующих запусках; `null`, если устройства нет |
 | `device_keys()` | Ключи для `AccountService.Register` |
@@ -47,6 +50,9 @@ crates/
 | Функция | Для чего |
 |---------|----------|
 | `generate_profile_key()` | Profile key аккаунта (32 байта), создаётся при регистрации |
+| `generate_provisioning_key_pair()` | Новое устройство: временная пара X25519 для QR-кода привязки |
+| `encrypt_provision(qr_public_key, plaintext)` | Основное устройство: зашифровать `ProvisionMessage` на ключ из QR → поля `ProvisionEnvelope` (X25519 → HKDF-SHA256 → AES-256-GCM, messenger-protocol README, «Привязка устройства») |
+| `decrypt_provision(qr_private_key, envelope)` | Новое устройство: расшифровать `ProvisionEnvelope`; подменённый конверт — `Malformed` |
 | `unidentified_access_key(profile_key)` | UAK (16 байт) = `HMAC-SHA256(profile_key, "KiVi unidentified access key v1")[0..16]` — для `RegisterRequest` и запросов sealed sender к собеседнику |
 
 ## Хранение состояния
@@ -85,6 +91,7 @@ interface KiviStore {
 - **Смена ключа и номера безопасности** (`tests/identity.rs`): у обоих собеседников один номер и QR-коды сходятся; при смене ключа сообщение от собеседника принимается, отправка ждёт подтверждения, после `trust_identity` переписка продолжается; отметка «проверено» не переносится на новый ключ; подделанные ключи с сервера не заменяют ключ собеседника; записи, сохранённые до появления `TrustedIdentity`, тоже ловят смену ключа.
 - **Sealed sender целиком** (`tests/sealed_sender.rs`): первое сообщение (с установкой сессии) и ответ собеседника через sealed sender с сертификатами, подписанными «как на сервере»; отказ при чужом trust root, истёкшем сертификате, сертификате чужого устройства и подменённом ключе идентичности.
 
+- **Привязка второго устройства** (`tests/linking.rs`): ключ идентичности передаётся в зашифрованном конверте, у нового устройства свои подписанные ключи; собеседник пишет обоим устройствам без предупреждения о смене ключа и с прежним номером безопасности; свои устройства синхронизируются друг с другом; имя устройства читается на любом устройстве аккаунта и не читается чужим; ключи, не образующие пару, отвергаются. Конверт с чужим ключом, изменённым шифротекстом или подменённым ключом отправителя не расшифровывается.
 - Сборка под Android (`arm64-v8a`, `armeabi-v7a`, `x86_64`, minSdk 26), выравнивание страниц 16 КБ для 64-битных библиотек (требование Google Play).
 
 ## Сборка
@@ -135,7 +142,7 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libkivi_ffi.so \
 
 ## Ключ идентичности
 
-Общий для всех устройств аккаунта (ADR-0003 в Messenger-KiVi). В `RemoteDeviceBundle` клиент подставляет `identity_public_key` из `GetPreKeyBundleResponse` — он одинаковый для всех устройств собеседника. Передача ключевой пары на привязываемое устройство — следующий шаг.
+Общий для всех устройств аккаунта (ADR-0003 в Messenger-KiVi). В `RemoteDeviceBundle` клиент подставляет `identity_public_key` из `GetPreKeyBundleResponse` — он одинаковый для всех устройств собеседника. Ключевая пара передаётся на привязываемое устройство в `ProvisionMessage`, зашифрованном на временный ключ из QR-кода (`encrypt_provision`), и принимается через `generate_with_identity`.
 
 ## Открытые вопросы
 

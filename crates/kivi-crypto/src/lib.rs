@@ -13,16 +13,23 @@
 #![forbid(unsafe_code)]
 
 mod device;
+mod device_name;
 mod error;
 mod profile;
 mod protocol_store;
+mod provisioning;
 mod storage;
 mod types;
 
 pub use device::LocalDevice;
+pub use device_name::MAX_DEVICE_NAME_CHARS;
 pub use error::CryptoError;
 pub use profile::{
     PROFILE_KEY_LEN, UNIDENTIFIED_ACCESS_KEY_LEN, generate_profile_key, unidentified_access_key,
+};
+pub use provisioning::{
+    ProvisionCiphertext, ProvisioningKeyPair, decrypt_provision, encrypt_provision,
+    generate_provisioning_key_pair,
 };
 pub use storage::{MemoryStorage, RecordKind, Storage, StorageError};
 pub use types::{
