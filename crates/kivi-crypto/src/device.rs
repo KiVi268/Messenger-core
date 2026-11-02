@@ -584,6 +584,58 @@ impl LocalDevice {
 
     /// Отмечает текущий ключ собеседника проверенным (номер безопасности
     /// сверен) или снимает отметку. Проверенный ключ заодно принимается.
+    /// Ключ собеседника, которому доверяет это устройство (принятый при первом контакте или
+    /// подтверждённый пользователем), для архива истории; `None` — ключ неизвестен. При смене
+    /// ключа это прежний, принятый ключ, а не новый.
+    pub fn trusted_identity_key(
+        &self,
+        remote_account_id: &str,
+    ) -> Result<Option<Vec<u8>>, CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let trusted = match self.protocol_store().trusted_identity(&name)? {
+            Some(key) => Some(key),
+            None => self.remote_identity(&name)?,
+        };
+        Ok(trusted.map(|key| key.serialize().into_vec()))
+    }
+
+    /// Перенос истории на привязанное устройство (ADR-0012): ключ собеседника, которому доверяло
+    /// основное устройство, и отметка «проверено». Если ключ собеседника здесь уже известен
+    /// (он написал после привязки), принятым считается перенесённый: другой текущий ключ даёт
+    /// [`IdentityStatus::Changed`], как и на основном устройстве. Не заменяется только ключ,
+    /// который на этом устройстве сверили вручную. Ключ — формат libsignal (`0x05` + 32 байта).
+    pub fn import_identity(
+        &self,
+        remote_account_id: &str,
+        identity_public_key: &[u8],
+        verified: bool,
+    ) -> Result<(), CryptoError> {
+        let name = account_name(remote_account_id)?;
+        let key = IdentityKey::decode(identity_public_key)
+            .map_err(|_| CryptoError::Malformed("identity public key".to_owned()))?;
+        let bytes = key.serialize();
+        // Сверенный здесь вручную ключ не заменяем. Остальное — автоматическое доверие при первом
+        // контакте после привязки: решение основного устройства важнее.
+        if self
+            .storage
+            .load(RecordKind::VerifiedIdentity, &name)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if self.remote_identity(&name)?.is_none() {
+            self.storage
+                .store(RecordKind::RemoteIdentity, &name, &bytes)?;
+        }
+        self.storage
+            .store(RecordKind::TrustedIdentity, &name, &bytes)?;
+        if verified {
+            self.storage
+                .store(RecordKind::VerifiedIdentity, &name, &bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn set_verified(&self, remote_account_id: &str, verified: bool) -> Result<(), CryptoError> {
         let name = account_name(remote_account_id)?;
         if !verified {
