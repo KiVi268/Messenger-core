@@ -203,3 +203,75 @@ fn linked_device_survives_restart() {
     assert_eq!(reopened.device_keys().unwrap(), keys);
     assert_eq!(reopened.identity_key_pair(), primary.identity_key_pair());
 }
+
+#[test]
+fn imported_identity_keeps_trust_and_verification_from_primary() {
+    let primary = LocalDevice::create(Arc::new(MemoryStorage::default()), ALICE, 1).unwrap();
+    let linked = link(&primary);
+    let bob = LocalDevice::create(Arc::new(MemoryStorage::default()), BOB, 1).unwrap();
+    let bob_key = bob.device_keys().unwrap().identity_public_key;
+
+    // Основное знало Боба и сверило номер безопасности — это приходит в архиве истории.
+    linked.import_identity(BOB, &bob_key, true).unwrap();
+    assert_eq!(
+        linked.identity_status(BOB).unwrap(),
+        IdentityStatus::Verified
+    );
+    assert!(linked.safety_number(BOB).unwrap().is_some());
+
+    // Сессия по тем же ключам — без предупреждения, отметка сохраняется.
+    linked
+        .process_bundle(BOB, &bundle(1, bob.device_keys().unwrap()))
+        .unwrap();
+    assert_eq!(
+        linked.identity_status(BOB).unwrap(),
+        IdentityStatus::Verified
+    );
+
+    // Боб переустановил приложение: новый ключ — смена, как и на основном.
+    let reinstalled = LocalDevice::create(Arc::new(MemoryStorage::default()), BOB, 1).unwrap();
+    assert!(
+        linked
+            .process_bundle(BOB, &bundle(1, reinstalled.device_keys().unwrap()))
+            .is_err()
+    );
+    assert_eq!(
+        linked.identity_status(BOB).unwrap(),
+        IdentityStatus::Changed
+    );
+
+    // Повторный импорт не отменяет предупреждение.
+    linked.import_identity(BOB, &bob_key, false).unwrap();
+    assert_eq!(
+        linked.identity_status(BOB).unwrap(),
+        IdentityStatus::Changed
+    );
+}
+
+#[test]
+fn identity_seen_after_linking_but_different_from_archive_is_a_change() {
+    let primary = LocalDevice::create(Arc::new(MemoryStorage::default()), ALICE, 1).unwrap();
+    let linked = link(&primary);
+    let old_bob = LocalDevice::create(Arc::new(MemoryStorage::default()), BOB, 1).unwrap();
+    let new_bob = LocalDevice::create(Arc::new(MemoryStorage::default()), BOB, 1).unwrap();
+
+    // Новый ключ Боба пришёл на планшет раньше архива, где основное доверяло старому.
+    linked
+        .process_bundle(BOB, &bundle(1, new_bob.device_keys().unwrap()))
+        .unwrap();
+    linked
+        .import_identity(
+            BOB,
+            &old_bob.device_keys().unwrap().identity_public_key,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        linked.identity_status(BOB).unwrap(),
+        IdentityStatus::Changed
+    );
+    assert!(matches!(
+        linked.import_identity(BOB, &[1, 2, 3], false),
+        Err(CryptoError::Malformed(_))
+    ));
+}

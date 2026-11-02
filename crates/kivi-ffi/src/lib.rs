@@ -446,6 +446,18 @@ impl KiviDevice {
     }
 
     /// Отметить ключ собеседника проверенным (номер сверен) или снять отметку.
+    /// Перенос истории: ключ собеседника, которому доверяло основное устройство, и отметка «проверено».
+    pub fn import_identity(
+        &self,
+        remote_account_id: String,
+        identity_public_key: Vec<u8>,
+        verified: bool,
+    ) -> Result<(), KiviError> {
+        Ok(self
+            .lock()
+            .import_identity(&remote_account_id, &identity_public_key, verified)?)
+    }
+
     pub fn set_verified(&self, remote_account_id: String, verified: bool) -> Result<(), KiviError> {
         Ok(self.lock().set_verified(&remote_account_id, verified)?)
     }
