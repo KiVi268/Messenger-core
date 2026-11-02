@@ -212,6 +212,14 @@ fn imported_identity_keeps_trust_and_verification_from_primary() {
     let bob_key = bob.device_keys().unwrap().identity_public_key;
 
     // Основное знало Боба и сверило номер безопасности — это приходит в архиве истории.
+    primary
+        .process_bundle(BOB, &bundle(1, bob.device_keys().unwrap()))
+        .unwrap();
+    assert_eq!(
+        primary.trusted_identity_key(BOB).unwrap(),
+        Some(bob_key.clone())
+    );
+    assert_eq!(primary.trusted_identity_key(ALICE).unwrap(), None);
     linked.import_identity(BOB, &bob_key, true).unwrap();
     assert_eq!(
         linked.identity_status(BOB).unwrap(),
